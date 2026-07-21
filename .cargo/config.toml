@@ -1,0 +1,4 @@
+[build]
+# Keep local builds responsive on machines that are also running editors,
+# containers and agents. Override explicitly with CARGO_BUILD_JOBS if desired.
+jobs = 1
