@@ -17,6 +17,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError, bounde
 use crate::{
     model::{DownloadEvent, DownloadRequest, TrackDraft},
     process::{configure_process_group, output_limited, terminate_process_group},
+    source::MAX_COLLECTION_ITEMS,
     storage::ensure_free_space,
 };
 
@@ -211,26 +212,86 @@ fn process_request(
     shutdown: &AtomicBool,
     events: &Sender<DownloadEvent>,
 ) -> Result<()> {
+    if request.items.is_empty() || request.items.len() > MAX_COLLECTION_ITEMS {
+        bail!("lote de download invalido");
+    }
     ensure_free_space(cache_dir, MIN_DOWNLOAD_FREE_BYTES)?;
     ensure_free_space(library_dir, MIN_DOWNLOAD_FREE_BYTES)?;
-    let safe_id = safe_component(&request.item.source_id);
-    let final_path = library_dir.join(format!("{}-{safe_id}.opus", request.item.provider));
-    if final_path.is_file() {
-        events.send(DownloadEvent::Completed {
-            job_id: request.job_id.clone(),
-            track: draft_for(request, final_path),
-        })?;
-        return Ok(());
-    }
-
     let job_dir = cache_dir
         .join("downloads")
         .join(safe_component(&request.job_id));
     fs::create_dir_all(&job_dir)?;
-    events.send(DownloadEvent::Downloading {
+    let mut sources: Vec<(String, PathBuf)> = Vec::new();
+    for item in &request.items {
+        let final_path = final_path(library_dir, item);
+        if final_path.is_file() || sources.iter().any(|(url, _)| url == &item.url) {
+            continue;
+        }
+        ensure_free_space(cache_dir, MIN_DOWNLOAD_FREE_BYTES)?;
+        events.send(DownloadEvent::Downloading {
+            job_id: request.job_id.clone(),
+        })?;
+        let source_dir = job_dir.join(format!("source-{:016x}", stable_hash(&item.url)));
+        fs::create_dir_all(&source_dir)?;
+        let input = download_source(yt_dlp, item, &source_dir, cancelled, shutdown)?;
+        sources.push((item.url.clone(), input));
+    }
+
+    let _conversion_guard = conversion_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let total = request.items.len();
+    let mut tracks = Vec::with_capacity(total);
+    for (index, item) in request.items.iter().enumerate() {
+        if is_cancelled(cancelled, shutdown) {
+            bail!("download cancelado");
+        }
+        let path = final_path(library_dir, item);
+        if !path.is_file() {
+            ensure_free_space(library_dir, MIN_DOWNLOAD_FREE_BYTES)?;
+            let input = sources
+                .iter()
+                .find(|(url, _)| url == &item.url)
+                .map(|(_, path)| path)
+                .context("fonte baixada nao encontrada")?;
+            events.send(DownloadEvent::Converting {
+                job_id: request.job_id.clone(),
+                current: index + 1,
+                total,
+            })?;
+            convert_item(
+                ffmpeg,
+                input,
+                item,
+                &path,
+                total,
+                bitrate_kbps,
+                cancelled,
+                shutdown,
+            )?;
+        }
+        tracks.push(draft_for(item, path));
+    }
+    let _ = fs::remove_dir_all(&job_dir);
+    events.send(DownloadEvent::Completed {
         job_id: request.job_id.clone(),
+        tracks,
+        album: request.album.clone(),
     })?;
-    let template = job_dir.join("input.%(ext)s");
+    Ok(())
+}
+
+fn download_source(
+    yt_dlp: &Path,
+    item: &crate::model::SearchItem,
+    source_dir: &Path,
+    cancelled: &AtomicBool,
+    shutdown: &AtomicBool,
+) -> Result<PathBuf> {
+    if let Some(input) = cached_input(source_dir) {
+        return Ok(input);
+    }
+    let template = source_dir.join("input.%(ext)s");
     let mut download = Command::new(yt_dlp);
     download.args([
         "--ignore-config",
@@ -256,9 +317,18 @@ fn process_request(
         "bestaudio/best",
         "-o",
     ]);
-    download.arg(&template).args(["--", &request.item.url]);
+    download.arg(&template).args(["--", &item.url]);
     run_cancellable(download, cancelled, shutdown, DOWNLOAD_TIMEOUT).context("download falhou")?;
-    let input = fs::read_dir(&job_dir)?
+    let input = cached_input(source_dir).context("yt-dlp terminou sem produzir um arquivo")?;
+    if fs::metadata(&input)?.len() > MAX_INPUT_BYTES {
+        bail!("arquivo de entrada excedeu o limite de 1 GiB");
+    }
+    Ok(input)
+}
+
+fn cached_input(source_dir: &Path) -> Option<PathBuf> {
+    fs::read_dir(source_dir)
+        .ok()?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .find(|path| {
@@ -269,23 +339,24 @@ fn process_request(
                     .map(|name| name.starts_with("input.") && !name.ends_with(".part"))
                     .unwrap_or(false)
         })
-        .context("yt-dlp terminou sem produzir um arquivo")?;
-    let input_size = fs::metadata(&input)?.len();
-    if input_size > MAX_INPUT_BYTES {
-        bail!("arquivo de entrada excedeu o limite de 1 GiB");
-    }
+}
 
-    let _conversion_guard = conversion_lock
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if is_cancelled(cancelled, shutdown) {
-        bail!("download cancelado");
-    }
-    events.send(DownloadEvent::Converting {
-        job_id: request.job_id.clone(),
-    })?;
-    let part_path = library_dir.join(format!(".{}-{safe_id}.opus.part", request.item.provider));
-    let is_opus = probe_is_opus(ffmpeg, &input);
+#[allow(clippy::too_many_arguments)]
+fn convert_item(
+    ffmpeg: &Path,
+    input: &Path,
+    item: &crate::model::SearchItem,
+    final_path: &Path,
+    total: usize,
+    bitrate_kbps: u16,
+    cancelled: &AtomicBool,
+    shutdown: &AtomicBool,
+) -> Result<()> {
+    let file_name = final_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("nome de arquivo de destino invalido")?;
+    let part_path = final_path.with_file_name(format!(".{file_name}.part"));
     let mut conversion = Command::new(ffmpeg);
     conversion.args([
         "-hide_banner",
@@ -296,8 +367,17 @@ fn process_request(
         "-y",
         "-i",
     ]);
-    conversion.arg(&input).args(["-vn", "-map_metadata", "-1"]);
-    if is_opus {
+    conversion.arg(input);
+    if let Some(segment) = &item.segment {
+        conversion.args([
+            "-ss",
+            &format!("{:.6}", segment.start_seconds),
+            "-t",
+            &format!("{:.6}", segment.end_seconds - segment.start_seconds),
+        ]);
+    }
+    conversion.args(["-vn", "-map_metadata", "-1"]);
+    if item.segment.is_none() && probe_is_opus(ffmpeg, input) {
         conversion.args(["-c:a", "copy"]);
     } else {
         conversion.args([
@@ -316,34 +396,40 @@ fn process_request(
         ]);
     }
     conversion
-        .args(["-metadata", &format!("title={}", request.item.title)])
-        .args(["-metadata", &format!("artist={}", request.item.artist)]);
-    if let Some(album) = &request.item.album {
+        .args(["-metadata", &format!("title={}", item.title)])
+        .args(["-metadata", &format!("artist={}", item.artist)]);
+    if let Some(album) = &item.album {
         conversion.args(["-metadata", &format!("album={album}")]);
+    }
+    if let Some(segment) = &item.segment {
+        conversion.args(["-metadata", &format!("track={}/{total}", segment.position)]);
     }
     conversion.args(["-f", "opus"]).arg(&part_path);
     if let Err(error) = run_cancellable(conversion, cancelled, shutdown, CONVERSION_TIMEOUT) {
         let _ = fs::remove_file(&part_path);
         return Err(error).context("conversao para Opus falhou");
     }
-    fs::rename(&part_path, &final_path).context("falha ao publicar faixa")?;
-    let _ = fs::remove_dir_all(&job_dir);
-    events.send(DownloadEvent::Completed {
-        job_id: request.job_id.clone(),
-        track: draft_for(request, final_path),
-    })?;
+    fs::rename(&part_path, final_path).context("falha ao publicar faixa")?;
     Ok(())
 }
 
-fn draft_for(request: &DownloadRequest, path: PathBuf) -> TrackDraft {
+fn final_path(library_dir: &Path, item: &crate::model::SearchItem) -> PathBuf {
+    library_dir.join(format!(
+        "{}-{}.opus",
+        safe_component(&item.provider),
+        safe_component(&item.source_id)
+    ))
+}
+
+fn draft_for(item: &crate::model::SearchItem, path: PathBuf) -> TrackDraft {
     TrackDraft {
-        provider: Some(request.item.provider.clone()),
-        source_id: Some(request.item.source_id.clone()),
-        title: request.item.title.clone(),
-        artist: request.item.artist.clone(),
-        album: request.item.album.clone(),
+        provider: Some(item.provider.clone()),
+        source_id: Some(item.source_id.clone()),
+        title: item.title.clone(),
+        artist: item.artist.clone(),
+        album: item.album.clone(),
         path,
-        duration_seconds: request.item.duration_seconds,
+        duration_seconds: item.duration_seconds,
         imported: false,
     }
 }
@@ -397,16 +483,25 @@ fn is_cancelled(cancelled: &AtomicBool, shutdown: &AtomicBool) -> bool {
 }
 
 pub fn safe_component(value: &str) -> String {
-    let filtered: String = value
+    let mut filtered: String = value
         .chars()
         .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
-        .take(96)
         .collect();
     if filtered.is_empty() {
         "unknown".into()
     } else {
+        if filtered.len() > 80 {
+            filtered.truncate(64);
+            filtered.push_str(&format!("-{:016x}", stable_hash(value)));
+        }
         filtered
     }
+}
+
+fn stable_hash(value: &str) -> u64 {
+    value.bytes().fold(0xcbf29ce484222325, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+    })
 }
 
 #[cfg(test)]

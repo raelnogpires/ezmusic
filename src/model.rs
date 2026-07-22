@@ -32,6 +32,33 @@ pub struct SearchItem {
     pub album: Option<String>,
     pub duration_seconds: Option<u64>,
     pub url: String,
+    pub segment: Option<MediaSegment>,
+    pub album_identity: Option<AlbumDraft>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MediaSegment {
+    pub start_seconds: f64,
+    pub end_seconds: f64,
+    pub position: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlbumDraft {
+    pub provider: String,
+    pub source_id: String,
+    pub title: String,
+    pub artist: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Album {
+    pub id: i64,
+    pub provider: String,
+    pub source_id: String,
+    pub title: String,
+    pub artist: String,
+    pub track_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -63,17 +90,36 @@ pub struct TrackDraft {
 #[derive(Debug, Clone)]
 pub struct DownloadRequest {
     pub job_id: String,
-    pub item: SearchItem,
+    pub items: Vec<SearchItem>,
+    pub album: Option<AlbumDraft>,
 }
 
 #[derive(Debug, Clone)]
 pub enum DownloadEvent {
-    Queued { job_id: String, title: String },
-    Downloading { job_id: String },
-    Converting { job_id: String },
-    Completed { job_id: String, track: TrackDraft },
-    Cancelled { job_id: String },
-    Failed { job_id: String, error: String },
+    Queued {
+        job_id: String,
+        title: String,
+    },
+    Downloading {
+        job_id: String,
+    },
+    Converting {
+        job_id: String,
+        current: usize,
+        total: usize,
+    },
+    Completed {
+        job_id: String,
+        tracks: Vec<TrackDraft>,
+        album: Option<AlbumDraft>,
+    },
+    Cancelled {
+        job_id: String,
+    },
+    Failed {
+        job_id: String,
+        error: String,
+    },
 }
 
 impl DownloadEvent {
@@ -81,7 +127,7 @@ impl DownloadEvent {
         match self {
             Self::Queued { job_id, .. }
             | Self::Downloading { job_id }
-            | Self::Converting { job_id }
+            | Self::Converting { job_id, .. }
             | Self::Completed { job_id, .. }
             | Self::Cancelled { job_id }
             | Self::Failed { job_id, .. } => job_id,

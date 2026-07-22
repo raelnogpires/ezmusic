@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use walkdir::WalkDir;
 
-use crate::model::{Track, TrackDraft};
+use crate::model::{Album, AlbumDraft, Track, TrackDraft};
 
 const MIGRATION: &str = r#"
 CREATE TABLE IF NOT EXISTS tracks (
@@ -27,6 +27,25 @@ CREATE TABLE IF NOT EXISTS tracks (
 );
 CREATE INDEX IF NOT EXISTS tracks_title_idx ON tracks(title COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS tracks_artist_idx ON tracks(artist COLLATE NOCASE);
+
+CREATE TABLE IF NOT EXISTS albums (
+    id INTEGER PRIMARY KEY,
+    provider TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    artist TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE(provider, source_id)
+);
+CREATE INDEX IF NOT EXISTS albums_title_idx ON albums(title COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS albums_artist_idx ON albums(artist COLLATE NOCASE);
+CREATE TABLE IF NOT EXISTS album_tracks (
+    album_id INTEGER NOT NULL REFERENCES albums(id) ON DELETE CASCADE,
+    track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL,
+    PRIMARY KEY(album_id, position),
+    UNIQUE(album_id, track_id)
+);
 
 CREATE TABLE IF NOT EXISTS imported_roots (
     path TEXT PRIMARY KEY,
@@ -97,57 +116,133 @@ impl LibraryDb {
     }
 
     pub fn upsert_track(&self, track: &TrackDraft) -> Result<i64> {
-        let path = track.path.to_string_lossy();
-        let now = unix_time();
-        self.connection.execute(
-            r#"INSERT INTO tracks
-               (provider, source_id, title, artist, album, path, duration_seconds, available, imported, created_at)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?9)
-               ON CONFLICT(path) DO UPDATE SET
-                 provider=excluded.provider, source_id=excluded.source_id,
-                 title=excluded.title, artist=excluded.artist, album=excluded.album,
-                 duration_seconds=excluded.duration_seconds, available=1, imported=excluded.imported"#,
-            params![
-                track.provider,
-                track.source_id,
-                track.title,
-                track.artist,
-                track.album,
-                path,
-                track.duration_seconds,
-                track.imported,
-                now,
-            ],
-        )?;
-        let id = self.connection.query_row(
-            "SELECT id FROM tracks WHERE path=?1",
-            [path.as_ref()],
-            |row| row.get(0),
-        )?;
-        Ok(id)
+        upsert_track(&self.connection, track)
     }
 
-    pub fn tracks(&self, filter: Option<&str>, limit: usize, offset: usize) -> Result<Vec<Track>> {
-        let limit = limit.min(MAX_QUERY_TRACKS);
-        let offset = offset.min(i64::MAX as usize);
+    pub fn upsert_album(&self, album: &AlbumDraft, tracks: &[TrackDraft]) -> Result<i64> {
+        if tracks.is_empty() || tracks.len() > 500 {
+            bail!("album deve conter entre 1 e 500 faixas");
+        }
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute(
+            "INSERT INTO albums(provider, source_id, title, artist, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(provider, source_id) DO UPDATE SET
+               title=excluded.title, artist=excluded.artist",
+            params![
+                album.provider,
+                album.source_id,
+                album.title,
+                album.artist,
+                unix_time()
+            ],
+        )?;
+        let album_id = transaction.query_row(
+            "SELECT id FROM albums WHERE provider=?1 AND source_id=?2",
+            params![album.provider, album.source_id],
+            |row| row.get(0),
+        )?;
+        transaction.execute("DELETE FROM album_tracks WHERE album_id=?1", [album_id])?;
+        for (position, track) in tracks.iter().enumerate() {
+            let track_id = upsert_track(&transaction, track)?;
+            transaction.execute(
+                "INSERT INTO album_tracks(album_id, track_id, position) VALUES (?1, ?2, ?3)",
+                params![album_id, track_id, position as i64],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(album_id)
+    }
+
+    pub fn albums(&self, filter: Option<&str>, limit: usize) -> Result<Vec<Album>> {
+        let limit = limit.min(MAX_QUERY_TRACKS) as i64;
         let mut output = Vec::new();
         if let Some(filter) = filter.filter(|value| !value.trim().is_empty()) {
             let pattern = format!("%{}%", filter.trim());
             let mut statement = self.connection.prepare(
-                "SELECT id, provider, source_id, title, artist, album, path, duration_seconds, available, imported
-                 FROM tracks WHERE title LIKE ?1 OR artist LIKE ?1 OR album LIKE ?1
-                 ORDER BY artist COLLATE NOCASE, title COLLATE NOCASE LIMIT ?2 OFFSET ?3",
+                "SELECT a.id, a.provider, a.source_id, a.title, a.artist, COUNT(at.track_id)
+                 FROM albums a LEFT JOIN album_tracks at ON at.album_id=a.id
+                 LEFT JOIN tracks t ON t.id=at.track_id
+                 WHERE a.title LIKE ?1 OR a.artist LIKE ?1 OR t.title LIKE ?1 OR t.artist LIKE ?1
+                 GROUP BY a.id ORDER BY a.artist COLLATE NOCASE, a.title COLLATE NOCASE LIMIT ?2",
             )?;
+            let rows = statement.query_map(params![pattern, limit], row_album)?;
+            for row in rows {
+                output.push(row?);
+            }
+        } else {
+            let mut statement = self.connection.prepare(
+                "SELECT a.id, a.provider, a.source_id, a.title, a.artist, COUNT(at.track_id)
+                 FROM albums a LEFT JOIN album_tracks at ON at.album_id=a.id
+                 GROUP BY a.id ORDER BY a.artist COLLATE NOCASE, a.title COLLATE NOCASE LIMIT ?1",
+            )?;
+            let rows = statement.query_map([limit], row_album)?;
+            for row in rows {
+                output.push(row?);
+            }
+        }
+        Ok(output)
+    }
+
+    pub fn album_tracks(&self, album_id: i64) -> Result<Vec<Track>> {
+        let mut statement = self.connection.prepare(
+            "SELECT t.id, t.provider, t.source_id, t.title, t.artist, t.album, t.path,
+                    t.duration_seconds, t.available, t.imported
+             FROM album_tracks at JOIN tracks t ON t.id=at.track_id
+             WHERE at.album_id=?1 ORDER BY at.position",
+        )?;
+        let rows = statement.query_map([album_id], row_track)?;
+        rows.map(|row| row.map_err(Into::into)).collect()
+    }
+
+    pub fn standalone_tracks(
+        &self,
+        filter: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<Track>> {
+        self.query_tracks(filter, limit, offset, true)
+    }
+
+    pub fn tracks(&self, filter: Option<&str>, limit: usize, offset: usize) -> Result<Vec<Track>> {
+        self.query_tracks(filter, limit, offset, false)
+    }
+
+    fn query_tracks(
+        &self,
+        filter: Option<&str>,
+        limit: usize,
+        offset: usize,
+        standalone_only: bool,
+    ) -> Result<Vec<Track>> {
+        let limit = limit.min(MAX_QUERY_TRACKS);
+        let offset = offset.min(i64::MAX as usize);
+        let standalone = if standalone_only {
+            " AND NOT EXISTS (SELECT 1 FROM album_tracks at WHERE at.track_id=tracks.id)"
+        } else {
+            ""
+        };
+        let mut output = Vec::new();
+        if let Some(filter) = filter.filter(|value| !value.trim().is_empty()) {
+            let pattern = format!("%{}%", filter.trim());
+            let sql = format!(
+                "SELECT id, provider, source_id, title, artist, album, path, duration_seconds, available, imported
+                 FROM tracks WHERE (title LIKE ?1 OR artist LIKE ?1 OR album LIKE ?1){standalone}
+                 ORDER BY artist COLLATE NOCASE, title COLLATE NOCASE LIMIT ?2 OFFSET ?3"
+            );
+            let mut statement = self.connection.prepare(&sql)?;
             let rows =
                 statement.query_map(params![pattern, limit as i64, offset as i64], row_track)?;
             for row in rows {
                 output.push(row?);
             }
         } else {
-            let mut statement = self.connection.prepare(
+            let sql = format!(
                 "SELECT id, provider, source_id, title, artist, album, path, duration_seconds, available, imported
-                 FROM tracks ORDER BY artist COLLATE NOCASE, title COLLATE NOCASE LIMIT ?1 OFFSET ?2",
-            )?;
+                 FROM tracks WHERE 1=1{standalone}
+                 ORDER BY artist COLLATE NOCASE, title COLLATE NOCASE LIMIT ?1 OFFSET ?2"
+            );
+            let mut statement = self.connection.prepare(&sql)?;
             let rows = statement.query_map(params![limit as i64, offset as i64], row_track)?;
             for row in rows {
                 output.push(row?);
@@ -354,6 +449,58 @@ impl LibraryDb {
     }
 }
 
+fn upsert_track(connection: &Connection, track: &TrackDraft) -> Result<i64> {
+    let path = track.path.to_string_lossy();
+    connection.execute(
+        r#"INSERT INTO tracks
+           (provider, source_id, title, artist, album, path, duration_seconds, available, imported, created_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?9)
+           ON CONFLICT(path) DO UPDATE SET
+             provider=excluded.provider, source_id=excluded.source_id,
+             title=excluded.title, artist=excluded.artist, album=excluded.album,
+             duration_seconds=excluded.duration_seconds, available=1, imported=excluded.imported
+           ON CONFLICT(provider, source_id) DO UPDATE SET
+             title=excluded.title, artist=excluded.artist, album=excluded.album,
+             path=excluded.path, duration_seconds=excluded.duration_seconds,
+             available=1, imported=excluded.imported"#,
+        params![
+            track.provider,
+            track.source_id,
+            track.title,
+            track.artist,
+            track.album,
+            path,
+            track.duration_seconds,
+            track.imported,
+            unix_time(),
+        ],
+    )?;
+    if let (Some(provider), Some(source_id)) = (&track.provider, &track.source_id) {
+        Ok(connection.query_row(
+            "SELECT id FROM tracks WHERE provider=?1 AND source_id=?2",
+            params![provider, source_id],
+            |row| row.get(0),
+        )?)
+    } else {
+        Ok(connection.query_row(
+            "SELECT id FROM tracks WHERE path=?1",
+            [path.as_ref()],
+            |row| row.get(0),
+        )?)
+    }
+}
+
+fn row_album(row: &rusqlite::Row<'_>) -> rusqlite::Result<Album> {
+    Ok(Album {
+        id: row.get(0)?,
+        provider: row.get(1)?,
+        source_id: row.get(2)?,
+        title: row.get(3)?,
+        artist: row.get(4)?,
+        track_count: row.get(5)?,
+    })
+}
+
 fn row_track(row: &rusqlite::Row<'_>) -> rusqlite::Result<Track> {
     Ok(Track {
         id: row.get(0)?,
@@ -480,5 +627,80 @@ mod tests {
     fn rejects_empty_playlist_names() {
         let db = LibraryDb::in_memory().unwrap();
         assert!(db.create_playlist("   ").is_err());
+    }
+
+    #[test]
+    fn migrates_existing_database_without_losing_tracks() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("library.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE tracks (
+                    id INTEGER PRIMARY KEY, provider TEXT, source_id TEXT, title TEXT NOT NULL,
+                    artist TEXT NOT NULL, album TEXT, path TEXT NOT NULL UNIQUE,
+                    duration_seconds INTEGER, available INTEGER NOT NULL DEFAULT 1,
+                    imported INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL,
+                    UNIQUE(provider, source_id));
+                 INSERT INTO tracks(title, artist, path, created_at)
+                 VALUES ('Legacy', 'Artist', '/tmp/legacy.opus', 1);",
+            )
+            .unwrap();
+        drop(connection);
+
+        let db = LibraryDb::open(path).unwrap();
+        assert_eq!(db.tracks(None, 10, 0).unwrap()[0].title, "Legacy");
+        assert!(db.albums(None, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn upserts_album_tracks_transactionally_in_source_order() {
+        let db = LibraryDb::in_memory().unwrap();
+        let album = AlbumDraft {
+            provider: "youtube".into(),
+            source_id: "video".into(),
+            title: "Record".into(),
+            artist: "Artist".into(),
+        };
+        let drafts: Vec<_> = ["One", "Two"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, title)| TrackDraft {
+                provider: Some("youtube".into()),
+                source_id: Some(format!("video-chapter-{index}")),
+                title: title.into(),
+                artist: "Artist".into(),
+                album: Some("Record".into()),
+                path: PathBuf::from(format!("/tmp/chapter-{index}.opus")),
+                duration_seconds: Some(60),
+                imported: false,
+            })
+            .collect();
+        let first = db.upsert_album(&album, &drafts).unwrap();
+        let second = db.upsert_album(&album, &drafts).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(db.albums(None, 10).unwrap()[0].track_count, 2);
+        assert_eq!(
+            db.album_tracks(first)
+                .unwrap()
+                .into_iter()
+                .map(|track| track.title)
+                .collect::<Vec<_>>(),
+            ["One", "Two"]
+        );
+        assert!(db.standalone_tracks(None, 10, 0).unwrap().is_empty());
+
+        db.upsert_track(&TrackDraft {
+            provider: None,
+            source_id: None,
+            title: "Standalone".into(),
+            artist: "Artist".into(),
+            album: None,
+            path: PathBuf::from("/tmp/standalone.opus"),
+            duration_seconds: None,
+            imported: true,
+        })
+        .unwrap();
+        assert_eq!(db.standalone_tracks(None, 10, 0).unwrap().len(), 1);
     }
 }

@@ -88,7 +88,7 @@ enum BackgroundEvent {
         kind: SearchKind,
         result: Result<Vec<SearchItem>>,
     },
-    DownloadTools(Result<(PathBuf, PathBuf, Vec<SearchItem>)>),
+    DownloadTools(Result<(PathBuf, PathBuf, Vec<DownloadRequest>)>),
     Import(Result<usize>),
 }
 
@@ -274,7 +274,7 @@ impl App {
             BackgroundEvent::DownloadTools(result) => {
                 self.busy = false;
                 match result {
-                    Ok((yt_dlp, ffmpeg, items)) => {
+                    Ok((yt_dlp, ffmpeg, requests)) => {
                         if self.downloads.is_none() {
                             match DownloadService::start(
                                 yt_dlp,
@@ -291,8 +291,8 @@ impl App {
                                 }
                             }
                         }
-                        for item in items {
-                            self.enqueue_item(item);
+                        for request in requests {
+                            self.enqueue_request(request);
                         }
                         self.screen = Screen::Downloads;
                     }
@@ -361,10 +361,17 @@ impl App {
             DownloadEvent::Downloading { .. } => {
                 self.update_job(&job_id, "baixando", None);
             }
-            DownloadEvent::Converting { .. } => {
-                self.update_job(&job_id, "convertendo", None);
+            DownloadEvent::Converting { current, total, .. } => {
+                self.update_job(&job_id, &format!("convertendo {current}/{total}"), None);
             }
-            DownloadEvent::Completed { track, .. } => match self.db.upsert_track(&track) {
+            DownloadEvent::Completed { tracks, album, .. } => match album.as_ref().map_or_else(
+                || {
+                    tracks
+                        .iter()
+                        .try_for_each(|track| self.db.upsert_track(track).map(|_| ()))
+                },
+                |album| self.db.upsert_album(album, &tracks).map(|_| ()),
+            ) {
                 Ok(_) => {
                     self.update_job(&job_id, "concluido", None);
                     self.refresh_library();
@@ -511,10 +518,8 @@ impl App {
             self.status = format!("Selecao excede o limite de {MAX_COLLECTION_ITEMS} faixas.");
             return;
         }
-        items.sort_by(|left, right| left.source_id.cmp(&right.source_id));
-        items.dedup_by(|left, right| {
-            left.provider == right.provider && left.source_id == right.source_id
-        });
+        let mut selected = HashSet::new();
+        items.retain(|item| selected.insert((item.provider.clone(), item.source_id.clone())));
         self.busy = true;
         self.status = format!(
             "Resolvendo e preparando {} item(ns) para download...",
@@ -527,51 +532,51 @@ impl App {
                 let provider = YouTubeProvider::new(yt_dlp.clone());
                 let mut resolved = Vec::new();
                 for item in items {
-                    match item.kind {
-                        SearchKind::Album | SearchKind::Playlist => {
-                            let collection = provider.resolve(&item.url)?;
-                            if resolved.len().saturating_add(collection.len())
-                                > MAX_COLLECTION_ITEMS
-                            {
-                                anyhow::bail!(
-                                    "selecao excede o limite de {MAX_COLLECTION_ITEMS} faixas"
-                                );
-                            }
-                            resolved.extend(collection);
+                    if item.segment.is_some() || item.album_identity.is_some() {
+                        resolved.push(item);
+                    } else {
+                        let collection = provider.resolve(&item.url)?;
+                        if resolved.len().saturating_add(collection.len()) > MAX_COLLECTION_ITEMS {
+                            anyhow::bail!(
+                                "selecao excede o limite de {MAX_COLLECTION_ITEMS} faixas"
+                            );
                         }
-                        SearchKind::Track | SearchKind::Unknown => resolved.push(item),
+                        resolved.extend(collection);
                     }
                 }
-                resolved.sort_by(|left, right| left.source_id.cmp(&right.source_id));
-                resolved.dedup_by(|left, right| {
-                    left.provider == right.provider && left.source_id == right.source_id
-                });
+                let mut seen = HashSet::new();
+                resolved
+                    .retain(|item| seen.insert((item.provider.clone(), item.source_id.clone())));
+                let requests = download_requests(resolved);
                 tools
                     .ensure(ToolKind::Ffmpeg)
-                    .map(|ffmpeg| (yt_dlp, ffmpeg, resolved))
+                    .map(|ffmpeg| (yt_dlp, ffmpeg, requests))
             });
             let _ = sender.send(BackgroundEvent::DownloadTools(result));
         });
     }
 
-    fn enqueue_item(&mut self, item: SearchItem) {
-        let job_id = format!(
-            "{}-{}",
-            safe_component(&item.provider),
-            safe_component(&item.source_id)
-        );
-        if self.jobs.iter().any(|job| job.id == job_id) {
-            return;
+    fn enqueue_request(&mut self, request: DownloadRequest) {
+        let job_id = request.job_id.clone();
+        if let Some(index) = self.jobs.iter().position(|job| job.id == job_id) {
+            if matches!(self.jobs[index].state.as_str(), "na fila" | "baixando")
+                || self.jobs[index].state.starts_with("convertendo")
+            {
+                return;
+            }
+            self.jobs.remove(index);
         }
         let Some(downloads) = &self.downloads else {
             self.status = "Servico de downloads indisponivel.".into();
             return;
         };
-        let title = item.title.clone();
-        match downloads.enqueue(DownloadRequest {
-            job_id: job_id.clone(),
-            item,
-        }) {
+        let title = request
+            .album
+            .as_ref()
+            .map(|album| album.title.clone())
+            .or_else(|| request.items.first().map(|item| item.title.clone()))
+            .unwrap_or_else(|| "Download".into());
+        match downloads.enqueue(request) {
             Ok(()) => self.handle_download(DownloadEvent::Queued { job_id, title }),
             Err(error) => self.status = format!("Falha ao enfileirar: {error:#}"),
         }
@@ -1676,6 +1681,42 @@ fn centered_rect(width_percent: u16, height_percent: u16, area: Rect) -> Rect {
         .split(vertical[1])[1]
 }
 
+fn download_requests(items: Vec<SearchItem>) -> Vec<DownloadRequest> {
+    let mut requests: Vec<DownloadRequest> = Vec::new();
+    for item in items {
+        if let Some(album) = item.album_identity.clone() {
+            if let Some(request) = requests.iter_mut().find(|request| {
+                request.album.as_ref().is_some_and(|existing| {
+                    existing.provider == album.provider && existing.source_id == album.source_id
+                })
+            }) {
+                request.items.push(item);
+            } else {
+                requests.push(DownloadRequest {
+                    job_id: format!(
+                        "{}-album-{}",
+                        safe_component(&album.provider),
+                        safe_component(&album.source_id)
+                    ),
+                    items: vec![item],
+                    album: Some(album),
+                });
+            }
+        } else {
+            requests.push(DownloadRequest {
+                job_id: format!(
+                    "{}-{}",
+                    safe_component(&item.provider),
+                    safe_component(&item.source_id)
+                ),
+                items: vec![item],
+                album: None,
+            });
+        }
+    }
+    requests
+}
+
 fn next_index(current: usize, length: usize) -> usize {
     if length == 0 {
         0
@@ -1759,6 +1800,8 @@ mod tests {
             album: None,
             duration_seconds: Some(180),
             url: format!("https://www.youtube.com/watch?v={id}"),
+            segment: None,
+            album_identity: None,
         }
     }
 
@@ -1857,6 +1900,24 @@ mod tests {
             search_item("two", SearchKind::Track),
         ];
         assert_eq!(app.full_collection_items().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn groups_one_logical_album_into_one_download_request() {
+        let album = crate::model::AlbumDraft {
+            provider: "youtube".into(),
+            source_id: "video".into(),
+            title: "Record".into(),
+            artist: "Artist".into(),
+        };
+        let mut one = search_item("one", SearchKind::Track);
+        one.album_identity = Some(album.clone());
+        let mut two = search_item("two", SearchKind::Track);
+        two.album_identity = Some(album);
+        let requests = download_requests(vec![one, two]);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].items.len(), 2);
+        assert!(requests[0].album.is_some());
     }
 
     #[test]

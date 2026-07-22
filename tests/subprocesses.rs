@@ -10,7 +10,7 @@ use std::{
 
 use ezmusic::{
     download::DownloadService,
-    model::{DownloadEvent, DownloadRequest, SearchItem, SearchKind},
+    model::{AlbumDraft, DownloadEvent, DownloadRequest, MediaSegment, SearchItem, SearchKind},
     source::{SourceProvider, YouTubeProvider},
 };
 use tempfile::tempdir;
@@ -123,7 +123,7 @@ printf 'OggS fake opus' > "$last"
     service
         .enqueue(DownloadRequest {
             job_id: "youtube-one".into(),
-            item: SearchItem {
+            items: vec![SearchItem {
                 provider: "youtube".into(),
                 source_id: "one".into(),
                 kind: SearchKind::Track,
@@ -132,7 +132,10 @@ printf 'OggS fake opus' > "$last"
                 album: None,
                 duration_seconds: Some(60),
                 url: "https://www.youtube.com/watch?v=one".into(),
-            },
+                segment: None,
+                album_identity: None,
+            }],
+            album: None,
         })
         .unwrap();
 
@@ -141,9 +144,9 @@ printf 'OggS fake opus' > "$last"
     while Instant::now() < deadline {
         for event in service.try_events() {
             match event {
-                DownloadEvent::Completed { track, .. } => {
-                    assert!(track.path.is_file());
-                    assert_eq!(track.path.extension().unwrap(), "opus");
+                DownloadEvent::Completed { tracks, .. } => {
+                    assert!(tracks[0].path.is_file());
+                    assert_eq!(tracks[0].path.extension().unwrap(), "opus");
                     completed = true;
                 }
                 DownloadEvent::Failed { error, .. } => panic!("{error}"),
@@ -178,7 +181,7 @@ fn dropping_download_service_stops_running_children() {
     service
         .enqueue(DownloadRequest {
             job_id: "youtube-slow".into(),
-            item: SearchItem {
+            items: vec![SearchItem {
                 provider: "youtube".into(),
                 source_id: "slow".into(),
                 kind: SearchKind::Track,
@@ -187,7 +190,10 @@ fn dropping_download_service_stops_running_children() {
                 album: None,
                 duration_seconds: None,
                 url: "https://www.youtube.com/watch?v=slow".into(),
-            },
+                segment: None,
+                album_identity: None,
+            }],
+            album: None,
         })
         .unwrap();
 
@@ -207,4 +213,112 @@ fn dropping_download_service_stops_running_children() {
     let started = Instant::now();
     drop(service);
     assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[test]
+fn chapter_album_downloads_source_once_and_publishes_every_track() {
+    let directory = tempdir().unwrap();
+    let ytdlp = directory.path().join("yt-dlp");
+    let ffmpeg = directory.path().join("ffmpeg");
+    let download_log = directory.path().join("downloads.log");
+    let conversion_log = directory.path().join("conversions.log");
+    executable(
+        &ytdlp,
+        &format!(
+            r#"#!/usr/bin/env bash
+set -eu
+printf 'download\n' >> '{}'
+out=""
+while (($#)); do
+  if [[ "$1" == "-o" ]]; then shift; out="$1"; fi
+  shift
+done
+out="${{out/'%(ext)s'/webm}}"
+printf 'one source' > "$out"
+"#,
+            download_log.display()
+        ),
+    );
+    executable(
+        &ffmpeg,
+        &format!(
+            r#"#!/usr/bin/env bash
+set -eu
+printf '%s\n' "$*" >> '{}'
+last=""
+for arg in "$@"; do last="$arg"; done
+printf 'OggS chapter' > "$last"
+"#,
+            conversion_log.display()
+        ),
+    );
+    let album = AlbumDraft {
+        provider: "youtube".into(),
+        source_id: "video".into(),
+        title: "Record".into(),
+        artist: "Artist".into(),
+    };
+    let items = [("One", 0.0, 60.0), ("Two", 60.0, 120.0)]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (title, start, end))| SearchItem {
+            provider: "youtube".into(),
+            source_id: format!("video-chapter-{index}"),
+            kind: SearchKind::Track,
+            title: title.into(),
+            artist: "Artist".into(),
+            album: Some("Record".into()),
+            duration_seconds: Some(60),
+            url: "https://www.youtube.com/watch?v=video".into(),
+            segment: Some(MediaSegment {
+                start_seconds: start,
+                end_seconds: end,
+                position: (index + 1) as u32,
+            }),
+            album_identity: Some(album.clone()),
+        })
+        .collect();
+    let library = directory.path().join("library");
+    let service = DownloadService::start(
+        ytdlp,
+        ffmpeg,
+        library.clone(),
+        directory.path().join("cache"),
+        1,
+        160,
+    )
+    .unwrap();
+    service
+        .enqueue(DownloadRequest {
+            job_id: "youtube-album-video".into(),
+            items,
+            album: Some(album),
+        })
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let tracks = loop {
+        if let Some(event) = service.try_event() {
+            match event {
+                DownloadEvent::Completed { tracks, .. } => break tracks,
+                DownloadEvent::Failed { error, .. } => panic!("{error}"),
+                _ => {}
+            }
+        }
+        assert!(Instant::now() < deadline, "album download timed out");
+        thread::sleep(Duration::from_millis(25));
+    };
+    assert_eq!(tracks.len(), 2);
+    assert!(tracks.iter().all(|track| track.path.is_file()));
+    assert_eq!(fs::read_to_string(download_log).unwrap().lines().count(), 1);
+    let conversions = fs::read_to_string(conversion_log).unwrap();
+    assert_eq!(conversions.lines().count(), 2);
+    assert!(conversions.contains("-ss 60.000000 -t 60.000000"));
+    assert!(fs::read_dir(library).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".part")
+    }));
 }

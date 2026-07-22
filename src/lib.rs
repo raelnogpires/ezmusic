@@ -11,4 +11,6 @@ pub mod tui;
 
 pub use config::{AppConfig, AppPaths};
 pub use db::LibraryDb;
-pub use model::{DownloadEvent, DownloadRequest, SearchItem, SearchKind, Track};
+pub use model::{
+    Album, AlbumDraft, DownloadEvent, DownloadRequest, MediaSegment, SearchItem, SearchKind, Track,
+};
