@@ -59,6 +59,7 @@ pub struct Album {
     pub title: String,
     pub artist: String,
     pub track_count: u64,
+    pub available_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]

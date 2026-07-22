@@ -160,10 +160,15 @@ impl LibraryDb {
         if let Some(filter) = filter.filter(|value| !value.trim().is_empty()) {
             let pattern = format!("%{}%", filter.trim());
             let mut statement = self.connection.prepare(
-                "SELECT a.id, a.provider, a.source_id, a.title, a.artist, COUNT(at.track_id)
+                "SELECT a.id, a.provider, a.source_id, a.title, a.artist, COUNT(at.track_id),
+                        COALESCE(SUM(album_track.available), 0)
                  FROM albums a LEFT JOIN album_tracks at ON at.album_id=a.id
-                 LEFT JOIN tracks t ON t.id=at.track_id
-                 WHERE a.title LIKE ?1 OR a.artist LIKE ?1 OR t.title LIKE ?1 OR t.artist LIKE ?1
+                 LEFT JOIN tracks album_track ON album_track.id=at.track_id
+                 WHERE a.title LIKE ?1 OR a.artist LIKE ?1 OR EXISTS (
+                   SELECT 1 FROM album_tracks matched
+                   JOIN tracks t ON t.id=matched.track_id
+                   WHERE matched.album_id=a.id AND (t.title LIKE ?1 OR t.artist LIKE ?1)
+                 )
                  GROUP BY a.id ORDER BY a.artist COLLATE NOCASE, a.title COLLATE NOCASE LIMIT ?2",
             )?;
             let rows = statement.query_map(params![pattern, limit], row_album)?;
@@ -172,8 +177,10 @@ impl LibraryDb {
             }
         } else {
             let mut statement = self.connection.prepare(
-                "SELECT a.id, a.provider, a.source_id, a.title, a.artist, COUNT(at.track_id)
+                "SELECT a.id, a.provider, a.source_id, a.title, a.artist, COUNT(at.track_id),
+                        COALESCE(SUM(album_track.available), 0)
                  FROM albums a LEFT JOIN album_tracks at ON at.album_id=a.id
+                 LEFT JOIN tracks album_track ON album_track.id=at.track_id
                  GROUP BY a.id ORDER BY a.artist COLLATE NOCASE, a.title COLLATE NOCASE LIMIT ?1",
             )?;
             let rows = statement.query_map([limit], row_album)?;
@@ -498,6 +505,7 @@ fn row_album(row: &rusqlite::Row<'_>) -> rusqlite::Result<Album> {
         title: row.get(3)?,
         artist: row.get(4)?,
         track_count: row.get(5)?,
+        available_count: row.get(6)?,
     })
 }
 

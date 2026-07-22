@@ -29,7 +29,7 @@ use crate::{
     config::{AppConfig, AppPaths},
     db::LibraryDb,
     download::{DownloadService, safe_component},
-    model::{DownloadEvent, DownloadRequest, SearchItem, SearchKind, Track},
+    model::{Album, DownloadEvent, DownloadRequest, SearchItem, SearchKind, Track},
     player::{AudioPlayer, PlaybackState, PlayerEvent},
     source::{MAX_COLLECTION_ITEMS, SourceProvider, YouTubeProvider, is_http_url},
     tools::{ToolKind, ToolManager},
@@ -48,6 +48,7 @@ enum Screen {
 enum InputMode {
     None,
     Search,
+    LibraryFilter,
     Import,
     Playlist { track_id: i64 },
 }
@@ -114,6 +115,13 @@ struct SearchPage {
     index: usize,
 }
 
+struct AlbumDetail {
+    album: Album,
+    tracks: Vec<Track>,
+    index: usize,
+    parent_index: usize,
+}
+
 struct App {
     paths: AppPaths,
     config: AppConfig,
@@ -135,8 +143,11 @@ struct App {
     search_results: Vec<SearchItem>,
     selected_results: HashSet<usize>,
     search_index: usize,
+    albums: Vec<Album>,
     library: Vec<Track>,
     library_index: usize,
+    library_filter: String,
+    album_detail: Option<AlbumDetail>,
     queue: Vec<Track>,
     queue_index: usize,
     current_index: Option<usize>,
@@ -154,7 +165,8 @@ impl App {
     fn new(paths: AppPaths, config: AppConfig, db: LibraryDb) -> Result<Self> {
         let (background_tx, background_rx) = unbounded();
         let tools = ToolManager::new(paths.clone());
-        let library = db.tracks(None, 500, 0)?;
+        let albums = db.albums(None, 500)?;
+        let library = db.standalone_tracks(None, 500, 0)?;
         let queue = db.load_queue()?;
         let playlists = db.playlists()?;
         let show_notice = !config.accepted_download_notice;
@@ -180,8 +192,11 @@ impl App {
             search_results: Vec::new(),
             selected_results: HashSet::new(),
             search_index: 0,
+            albums,
             library,
             library_index: 0,
+            library_filter: String::new(),
+            album_detail: None,
             queue,
             queue_index: 0,
             current_index: None,
@@ -396,14 +411,118 @@ impl App {
     }
 
     fn refresh_library(&mut self) {
-        match self.db.tracks(None, 500, 0) {
-            Ok(tracks) => {
+        let filter = (!self.library_filter.is_empty()).then_some(self.library_filter.as_str());
+        match (
+            self.db.albums(filter, 500),
+            self.db.standalone_tracks(filter, 500, 0),
+        ) {
+            (Ok(albums), Ok(tracks)) => {
+                self.albums = albums;
                 self.library = tracks;
-                self.library_index = self.library_index.min(self.library.len().saturating_sub(1));
+                self.library_index = self.library_index.min(self.library_len().saturating_sub(1));
             }
-            Err(error) => self.status = format!("Falha ao ler biblioteca: {error:#}"),
+            (Err(error), _) | (_, Err(error)) => {
+                self.status = format!("Falha ao ler biblioteca: {error:#}")
+            }
+        }
+        if let Some(detail) = &mut self.album_detail {
+            match self.db.album_tracks(detail.album.id) {
+                Ok(tracks) => {
+                    detail.tracks = tracks;
+                    detail.index = detail.index.min(detail.tracks.len().saturating_sub(1));
+                }
+                Err(error) => self.status = format!("Falha ao ler album: {error:#}"),
+            }
         }
         self.playlists = self.db.playlists().unwrap_or_default();
+    }
+
+    fn apply_library_filter(&mut self) {
+        self.library_filter = self.input.trim().to_string();
+        self.input.clear();
+        self.input_mode = InputMode::None;
+        self.library_index = 0;
+        self.album_detail = None;
+        self.refresh_library();
+        self.status = if self.library_filter.is_empty() {
+            "Filtro da biblioteca removido.".into()
+        } else {
+            format!("Biblioteca filtrada por: {}", self.library_filter)
+        };
+    }
+
+    fn library_len(&self) -> usize {
+        self.albums.len() + self.library.len()
+    }
+
+    fn selected_library_track(&self) -> Option<&Track> {
+        self.library
+            .get(self.library_index.saturating_sub(self.albums.len()))
+            .filter(|_| self.library_index >= self.albums.len())
+    }
+
+    fn open_library_selection(&mut self) {
+        if let Some(album) = self.albums.get(self.library_index).cloned() {
+            match self.db.album_tracks(album.id) {
+                Ok(tracks) => {
+                    self.album_detail = Some(AlbumDetail {
+                        album,
+                        tracks,
+                        index: 0,
+                        parent_index: self.library_index,
+                    });
+                    self.status = "Album aberto. Enter toca a faixa; A toca o album.".into();
+                }
+                Err(error) => self.status = format!("Falha ao abrir album: {error:#}"),
+            }
+        } else {
+            self.play_library();
+        }
+    }
+
+    fn close_album(&mut self) {
+        if let Some(detail) = self.album_detail.take() {
+            self.library_index = detail
+                .parent_index
+                .min(self.library_len().saturating_sub(1));
+            self.status = "Biblioteca restaurada.".into();
+        }
+    }
+
+    fn play_album(&mut self, from_selection: bool) {
+        let Some(detail) = &self.album_detail else {
+            return;
+        };
+        let selected_id = from_selection
+            .then(|| detail.tracks.get(detail.index))
+            .flatten()
+            .map(|track| track.id);
+        if from_selection
+            && detail
+                .tracks
+                .get(detail.index)
+                .is_some_and(|track| !track.available)
+        {
+            self.status = "Arquivo indisponivel. Restaure o caminho para tocar esta faixa.".into();
+            return;
+        }
+        let tracks = detail.tracks.clone();
+        self.start_queue(tracks, selected_id);
+    }
+
+    fn start_queue(&mut self, tracks: Vec<Track>, selected_id: Option<i64>) {
+        let available: Vec<_> = tracks.into_iter().filter(|track| track.available).collect();
+        if available.is_empty() {
+            self.status = "Nenhuma faixa disponivel nesta colecao.".into();
+            return;
+        }
+        self.queue = available;
+        self.current_index = selected_id
+            .and_then(|id| self.queue.iter().position(|track| track.id == id))
+            .or(Some(0));
+        self.queue_index = self.current_index.unwrap_or(0);
+        self.persist_queue();
+        self.play_current();
     }
 
     fn submit_search(&mut self) {
@@ -624,10 +743,9 @@ impl App {
     }
 
     fn play_library(&mut self) {
-        if self.library.is_empty() {
+        let Some(selected) = self.selected_library_track().cloned() else {
             return;
-        }
-        let selected = self.library[self.library_index].clone();
+        };
         if !selected.available {
             self.status = "Arquivo indisponivel. Importe novamente ou restaure o caminho.".into();
             return;
@@ -640,17 +758,8 @@ impl App {
             self.toggle_playback();
             return;
         }
-        self.queue = self
-            .library
-            .iter()
-            .filter(|track| track.available)
-            .cloned()
-            .collect();
         let selected_id = selected.id;
-        self.current_index = self.queue.iter().position(|track| track.id == selected_id);
-        self.queue_index = self.current_index.unwrap_or(0);
-        self.persist_queue();
-        self.play_current();
+        self.start_queue(self.library.clone(), Some(selected_id));
     }
 
     fn activate_queue_track(&mut self, index: usize) {
@@ -788,7 +897,11 @@ impl App {
             KeyCode::Char('4') => self.screen = Screen::Downloads,
             KeyCode::Char('5') => self.screen = Screen::Playlists,
             KeyCode::Char('/') => {
-                self.input_mode = InputMode::Search;
+                self.input_mode = if self.screen == Screen::Library {
+                    InputMode::LibraryFilter
+                } else {
+                    InputMode::Search
+                };
                 self.input.clear();
             }
             KeyCode::Char('I') => {
@@ -817,6 +930,11 @@ impl App {
             KeyCode::Esc | KeyCode::Backspace if self.screen == Screen::Search => {
                 self.back_search()
             }
+            KeyCode::Esc | KeyCode::Backspace
+                if self.screen == Screen::Library && self.album_detail.is_some() =>
+            {
+                self.close_album()
+            }
             KeyCode::Char('?') => self.show_help = true,
             _ => self.screen_key(key),
         }
@@ -833,6 +951,7 @@ impl App {
             }
             KeyCode::Enter => match self.input_mode {
                 InputMode::Search => self.submit_search(),
+                InputMode::LibraryFilter => self.apply_library_filter(),
                 InputMode::Import => self.submit_import(),
                 InputMode::Playlist { track_id } => self.submit_playlist(track_id),
                 InputMode::None => {}
@@ -872,14 +991,34 @@ impl App {
             },
             Screen::Library => match key.code {
                 KeyCode::Up | KeyCode::Char('k') => {
-                    self.library_index = self.library_index.saturating_sub(1)
+                    if let Some(detail) = &mut self.album_detail {
+                        detail.index = detail.index.saturating_sub(1);
+                    } else {
+                        self.library_index = self.library_index.saturating_sub(1);
+                    }
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    self.library_index = next_index(self.library_index, self.library.len())
+                    if let Some(detail) = &mut self.album_detail {
+                        detail.index = next_index(detail.index, detail.tracks.len());
+                    } else {
+                        self.library_index = next_index(self.library_index, self.library_len());
+                    }
                 }
-                KeyCode::Enter => self.play_library(),
+                KeyCode::Enter => {
+                    if self.album_detail.is_some() {
+                        self.play_album(true);
+                    } else {
+                        self.open_library_selection();
+                    }
+                }
+                KeyCode::Char('A') if self.album_detail.is_some() => self.play_album(false),
                 KeyCode::Char('P') => {
-                    if let Some(track) = self.library.get(self.library_index) {
+                    let track = self
+                        .album_detail
+                        .as_ref()
+                        .and_then(|detail| detail.tracks.get(detail.index))
+                        .or_else(|| self.selected_library_track());
+                    if let Some(track) = track {
                         self.input_mode = InputMode::Playlist { track_id: track.id };
                         self.input.clear();
                     }
@@ -963,7 +1102,7 @@ impl App {
 
     fn input_limit(&self) -> usize {
         match self.input_mode {
-            InputMode::Search => MAX_SEARCH_INPUT_CHARS,
+            InputMode::Search | InputMode::LibraryFilter => MAX_SEARCH_INPUT_CHARS,
             InputMode::Import => MAX_PATH_INPUT_CHARS,
             InputMode::Playlist { .. } => MAX_PLAYLIST_NAME_CHARS,
             InputMode::None => 0,
@@ -1096,7 +1235,9 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ));
         navigation.push(Span::raw(" "));
     }
-    if !app.search_history.is_empty() && app.screen == Screen::Search {
+    if (!app.search_history.is_empty() && app.screen == Screen::Search)
+        || app.screen == Screen::Library && app.album_detail.is_some()
+    {
         navigation.push(Span::styled(
             " ← ESC BACK ",
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
@@ -1190,48 +1331,99 @@ fn render_library(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .current_index
         .and_then(|index| app.queue.get(index))
         .map(|track| track.id);
-    let items = app
-        .library
+    if let Some(detail) = &app.album_detail {
+        let items = detail
+            .tracks
+            .iter()
+            .enumerate()
+            .map(|(index, track)| {
+                let marker = track_marker(app, track, current_id);
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("{marker} {:>3}  ", index + 1),
+                        Style::default().fg(ACCENT),
+                    ),
+                    Span::styled(track.title.clone(), Style::default().fg(TEXT)),
+                    Span::styled(format!("  /  {}", track.artist), Style::default().fg(MUTED)),
+                    Span::styled(
+                        format!("  {}", duration_label(track.duration_seconds)),
+                        Style::default().fg(MUTED),
+                    ),
+                ]))
+            })
+            .collect();
+        render_list(
+            frame,
+            area,
+            format!(
+                " LIBRARY / ALBUM / {} / {} TRACKS ",
+                detail.album.title.to_uppercase(),
+                detail.tracks.len()
+            ),
+            "[enter] play selected   [A] play album   [P] playlist   [esc] library",
+            items,
+            detail.index,
+        );
+        return;
+    }
+
+    let mut items: Vec<ListItem<'_>> = app
+        .albums
         .iter()
-        .enumerate()
-        .map(|(index, track)| {
-            let marker = if current_id == Some(track.id) {
-                match app.player.state() {
-                    PlaybackState::Paused => "Ⅱ",
-                    PlaybackState::Playing => "▶",
-                    PlaybackState::Stopped => " ",
-                }
-            } else if track.available {
-                " "
-            } else {
+        .map(|album| {
+            let marker = if album.available_count < album.track_count {
                 "!"
+            } else {
+                "▣"
             };
             ListItem::new(Line::from(vec![
+                Span::styled(format!("{marker} ALBUM  "), Style::default().fg(ACCENT)),
+                Span::styled(album.title.clone(), Style::default().fg(TEXT)),
+                Span::styled(format!("  /  {}", album.artist), Style::default().fg(MUTED)),
                 Span::styled(
-                    format!("{marker} {:>3}  ", index + 1),
-                    Style::default().fg(ACCENT),
-                ),
-                Span::styled(track.title.clone(), Style::default().fg(TEXT)),
-                Span::styled(format!("  /  {}", track.artist), Style::default().fg(MUTED)),
-                Span::styled(
-                    track
-                        .album
-                        .as_deref()
-                        .map(|album| format!("  ·  {album}"))
-                        .unwrap_or_default(),
+                    format!("  ·  {} tracks", album.track_count),
                     Style::default().fg(MUTED),
                 ),
             ]))
         })
         .collect();
+    items.extend(app.library.iter().enumerate().map(|(index, track)| {
+        let marker = track_marker(app, track, current_id);
+        ListItem::new(Line::from(vec![
+            Span::styled(
+                format!("{marker} TRACK {:>3}  ", index + 1),
+                Style::default().fg(ACCENT),
+            ),
+            Span::styled(track.title.clone(), Style::default().fg(TEXT)),
+            Span::styled(format!("  /  {}", track.artist), Style::default().fg(MUTED)),
+        ]))
+    }));
     render_list(
         frame,
         area,
-        format!(" LIBRARY / {} TRACKS ", app.library.len()),
-        "[enter] play or pause current   [P] playlist   [I] import folder",
+        format!(
+            " LIBRARY / {} ALBUMS + {} TRACKS ",
+            app.albums.len(),
+            app.library.len()
+        ),
+        "[/] filter   [enter] open/play   [P] playlist   [I] import folder",
         items,
         app.library_index,
     );
+}
+
+fn track_marker(app: &App, track: &Track, current_id: Option<i64>) -> &'static str {
+    if current_id == Some(track.id) {
+        match app.player.state() {
+            PlaybackState::Paused => "Ⅱ",
+            PlaybackState::Playing => "▶",
+            PlaybackState::Stopped => " ",
+        }
+    } else if track.available {
+        " "
+    } else {
+        "!"
+    }
 }
 
 fn render_queue(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -1368,12 +1560,21 @@ fn render_context(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let active_jobs = app
         .jobs
         .iter()
-        .filter(|job| matches!(job.state.as_str(), "na fila" | "baixando" | "convertendo"))
+        .filter(|job| {
+            matches!(job.state.as_str(), "na fila" | "baixando")
+                || job.state.starts_with("convertendo")
+        })
         .count();
+    let library_tracks = app.library.len()
+        + app
+            .albums
+            .iter()
+            .map(|album| album.track_count as usize)
+            .sum::<usize>();
     let lines = vec![
         Line::from(Span::styled("SYSTEM", Style::default().fg(ACCENT))),
         Line::from(""),
-        metric_line("library", app.library.len().to_string()),
+        metric_line("library", library_tracks.to_string()),
         metric_line("queue", app.queue.len().to_string()),
         metric_line("active jobs", active_jobs.to_string()),
         metric_line("audio underruns", app.player.underflows().to_string()),
@@ -1531,6 +1732,11 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
             format!("{}█", app.input),
             Style::default().fg(ACCENT),
         ),
+        InputMode::LibraryFilter => (
+            "FILTER",
+            format!("{}█", app.input),
+            Style::default().fg(ACCENT),
+        ),
         InputMode::Import => (
             "IMPORT",
             format!("{}█", app.input),
@@ -1568,7 +1774,9 @@ fn render_help(frame: &mut Frame<'_>) {
         Line::from(""),
         help_line("SPACE / p", "pause or resume the active track"),
         help_line("z", "stop playback and release the audio stream"),
-        help_line("Enter", "play selection; on active track, pause/resume"),
+        help_line("Enter", "open album or play selected track"),
+        help_line("A", "play an opened album from the beginning"),
+        help_line("P", "add a library/album track to a playlist"),
         help_line("b / n", "previous / next track"),
         help_line("← / →", "seek backward / forward 5 seconds"),
         help_line("+ / -", "change volume by 5%"),
@@ -1576,7 +1784,7 @@ fn render_help(frame: &mut Frame<'_>) {
         Line::from(""),
         help_line("1 ... 5", "switch workspace"),
         help_line("j / k", "move selection"),
-        help_line("/", "search artist, track, album or URL"),
+        help_line("/", "search online; in Library, filter collections"),
         help_line("Esc / Backspace", "return from an opened album or playlist"),
         help_line("A", "download the complete album or playlist"),
         help_line("I", "import a local audio directory"),
@@ -1805,6 +2013,30 @@ mod tests {
         }
     }
 
+    fn seed_album(app: &App, source_id: &str, titles: &[&str]) -> i64 {
+        let album = crate::model::AlbumDraft {
+            provider: "youtube".into(),
+            source_id: source_id.into(),
+            title: format!("Album {source_id}"),
+            artist: "Album Artist".into(),
+        };
+        let tracks: Vec<_> = titles
+            .iter()
+            .enumerate()
+            .map(|(index, title)| crate::model::TrackDraft {
+                provider: Some("youtube".into()),
+                source_id: Some(format!("{source_id}-{index}")),
+                title: (*title).into(),
+                artist: "Track Artist".into(),
+                album: Some(album.title.clone()),
+                path: PathBuf::from(format!("/tmp/{source_id}-{index}.opus")),
+                duration_seconds: Some(60),
+                imported: false,
+            })
+            .collect();
+        app.db.upsert_album(&album, &tracks).unwrap()
+    }
+
     #[test]
     fn selection_stays_in_bounds() {
         assert_eq!(next_index(0, 0), 0);
@@ -1918,6 +2150,77 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].items.len(), 2);
         assert!(requests[0].album.is_some());
+    }
+
+    #[test]
+    fn opens_album_without_playing_and_restores_parent_selection() {
+        let (_directory, mut app) = test_app();
+        seed_album(&app, "a", &["One"]);
+        seed_album(&app, "b", &["Two"]);
+        app.refresh_library();
+        app.library_index = 1;
+
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.album_detail.is_some());
+        assert!(app.queue.is_empty());
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.album_detail.is_none());
+        assert_eq!(app.library_index, 1);
+    }
+
+    #[test]
+    fn album_selection_builds_and_persists_ordered_queue() {
+        let (_directory, mut app) = test_app();
+        seed_album(&app, "record", &["One", "Two"]);
+        app.refresh_library();
+        app.open_library_selection();
+        app.screen_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.screen_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(
+            app.queue
+                .iter()
+                .map(|track| track.title.as_str())
+                .collect::<Vec<_>>(),
+            ["One", "Two"]
+        );
+        assert_eq!(app.queue_index, 1);
+        assert_eq!(app.db.load_queue().unwrap().len(), 2);
+        app.screen_key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::NONE));
+        assert_eq!(app.queue_index, 0);
+    }
+
+    #[test]
+    fn library_filter_matches_album_tracks_but_keeps_full_count() {
+        let (_directory, mut app) = test_app();
+        seed_album(&app, "record", &["First", "Needle"]);
+        app.input = "Needle".into();
+        app.apply_library_filter();
+        assert_eq!(app.albums.len(), 1);
+        assert_eq!(app.albums[0].track_count, 2);
+        assert!(app.library.is_empty());
+    }
+
+    #[test]
+    fn renders_album_detail_in_compact_and_wide_terminals() {
+        let (_directory, mut app) = test_app();
+        seed_album(&app, "record", &["One", "Two"]);
+        app.refresh_library();
+        app.open_library_selection();
+        for (width, height) in [(80, 24), (128, 36)] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            let output = terminal.backend().buffer().content().iter().fold(
+                String::new(),
+                |mut output, cell| {
+                    output.push_str(cell.symbol());
+                    output
+                },
+            );
+            assert!(output.contains("ALBUM RECORD"));
+            assert!(output.contains("play album"));
+        }
     }
 
     #[test]
