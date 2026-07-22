@@ -122,6 +122,14 @@ struct AlbumDetail {
     parent_index: usize,
 }
 
+struct PlaylistDetail {
+    id: i64,
+    name: String,
+    tracks: Vec<Track>,
+    index: usize,
+    parent_index: usize,
+}
+
 struct App {
     paths: AppPaths,
     config: AppConfig,
@@ -155,6 +163,7 @@ struct App {
     job_index: usize,
     playlists: Vec<(i64, String, u64)>,
     playlist_index: usize,
+    playlist_detail: Option<PlaylistDetail>,
     shuffle: bool,
     repeat: RepeatMode,
     show_help: bool,
@@ -204,6 +213,7 @@ impl App {
             job_index: 0,
             playlists,
             playlist_index: 0,
+            playlist_detail: None,
             shuffle: false,
             repeat: RepeatMode::Off,
             show_help: false,
@@ -742,6 +752,73 @@ impl App {
         }
     }
 
+    fn open_playlist(&mut self) {
+        let Some((id, name, _)) = self.playlists.get(self.playlist_index).cloned() else {
+            return;
+        };
+        match self.db.playlist_tracks(id) {
+            Ok(tracks) => {
+                self.playlist_detail = Some(PlaylistDetail {
+                    id,
+                    name,
+                    tracks,
+                    index: 0,
+                    parent_index: self.playlist_index,
+                });
+                self.status = "Playlist aberta. Enter toca a faixa; A toca desde o inicio.".into();
+            }
+            Err(error) => self.status = format!("Falha ao abrir playlist: {error:#}"),
+        }
+    }
+
+    fn close_playlist(&mut self) {
+        if let Some(detail) = self.playlist_detail.take() {
+            self.playlist_index = detail
+                .parent_index
+                .min(self.playlists.len().saturating_sub(1));
+            self.status = "Lista de playlists restaurada.".into();
+        }
+    }
+
+    fn play_playlist(&mut self, from_selection: bool) {
+        let Some(detail) = &self.playlist_detail else {
+            return;
+        };
+        let selected = from_selection
+            .then(|| detail.tracks.get(detail.index))
+            .flatten();
+        if selected.is_some_and(|track| !track.available) {
+            self.status = "Arquivo indisponivel. Restaure o caminho para tocar esta faixa.".into();
+            return;
+        }
+        let selected_id = selected.map(|track| track.id);
+        self.start_queue(detail.tracks.clone(), selected_id);
+    }
+
+    fn remove_playlist_track(&mut self) {
+        let Some(detail) = &self.playlist_detail else {
+            return;
+        };
+        let playlist_id = detail.id;
+        let position = detail.index;
+        match self.db.remove_from_playlist(playlist_id, position) {
+            Ok(true) => match self.db.playlist_tracks(playlist_id) {
+                Ok(tracks) => {
+                    if let Some(detail) = &mut self.playlist_detail {
+                        detail.tracks = tracks;
+                        detail.index = detail.index.min(detail.tracks.len().saturating_sub(1));
+                    }
+                    self.playlists = self.db.playlists().unwrap_or_default();
+                    self.status =
+                        "Faixa removida da playlist; biblioteca e fila preservadas.".into();
+                }
+                Err(error) => self.status = format!("Falha ao atualizar playlist: {error:#}"),
+            },
+            Ok(false) => self.status = "A faixa selecionada nao existe mais na playlist.".into(),
+            Err(error) => self.status = format!("Falha ao remover da playlist: {error:#}"),
+        }
+    }
+
     fn play_library(&mut self) {
         let Some(selected) = self.selected_library_track().cloned() else {
             return;
@@ -935,6 +1012,11 @@ impl App {
             {
                 self.close_album()
             }
+            KeyCode::Esc | KeyCode::Backspace
+                if self.screen == Screen::Playlists && self.playlist_detail.is_some() =>
+            {
+                self.close_playlist()
+            }
             KeyCode::Char('?') => self.show_help = true,
             _ => self.screen_key(key),
         }
@@ -1072,28 +1154,29 @@ impl App {
             },
             Screen::Playlists => match key.code {
                 KeyCode::Up | KeyCode::Char('k') => {
-                    self.playlist_index = self.playlist_index.saturating_sub(1)
+                    if let Some(detail) = &mut self.playlist_detail {
+                        detail.index = detail.index.saturating_sub(1);
+                    } else {
+                        self.playlist_index = self.playlist_index.saturating_sub(1);
+                    }
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    self.playlist_index = next_index(self.playlist_index, self.playlists.len())
+                    if let Some(detail) = &mut self.playlist_detail {
+                        detail.index = next_index(detail.index, detail.tracks.len());
+                    } else {
+                        self.playlist_index = next_index(self.playlist_index, self.playlists.len());
+                    }
                 }
                 KeyCode::Enter => {
-                    if let Some((id, name, _)) = self.playlists.get(self.playlist_index).cloned() {
-                        match self.db.playlist_tracks(id) {
-                            Ok(tracks) if !tracks.is_empty() => {
-                                self.queue = tracks;
-                                self.current_index = Some(0);
-                                self.queue_index = 0;
-                                self.persist_queue();
-                                self.play_current();
-                                self.status = format!("Playlist: {name}");
-                            }
-                            Ok(_) => self.status = "Playlist vazia.".into(),
-                            Err(error) => {
-                                self.status = format!("Falha ao abrir playlist: {error:#}")
-                            }
-                        }
+                    if self.playlist_detail.is_some() {
+                        self.play_playlist(true);
+                    } else {
+                        self.open_playlist();
                     }
+                }
+                KeyCode::Char('A') if self.playlist_detail.is_some() => self.play_playlist(false),
+                KeyCode::Delete | KeyCode::Char('x') if self.playlist_detail.is_some() => {
+                    self.remove_playlist_track()
                 }
                 _ => {}
             },
@@ -1237,6 +1320,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
     if (!app.search_history.is_empty() && app.screen == Screen::Search)
         || app.screen == Screen::Library && app.album_detail.is_some()
+        || app.screen == Screen::Playlists && app.playlist_detail.is_some()
     {
         navigation.push(Span::styled(
             " ← ESC BACK ",
@@ -1498,6 +1582,48 @@ fn render_downloads(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn render_playlists(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    if let Some(detail) = &app.playlist_detail {
+        let current_id = app
+            .current_index
+            .and_then(|index| app.queue.get(index))
+            .map(|track| track.id);
+        let items = if detail.tracks.is_empty() {
+            vec![ListItem::new(Line::from(Span::styled(
+                "  Playlist vazia.",
+                Style::default().fg(MUTED),
+            )))]
+        } else {
+            detail
+                .tracks
+                .iter()
+                .enumerate()
+                .map(|(index, track)| {
+                    let marker = track_marker(app, track, current_id);
+                    ListItem::new(Line::from(vec![
+                        Span::styled(
+                            format!("{marker} {:>3}  ", index + 1),
+                            Style::default().fg(ACCENT),
+                        ),
+                        Span::styled(track.title.clone(), Style::default().fg(TEXT)),
+                        Span::styled(format!("  /  {}", track.artist), Style::default().fg(MUTED)),
+                    ]))
+                })
+                .collect()
+        };
+        render_list(
+            frame,
+            area,
+            format!(
+                " PLAYLIST / {} / {} TRACKS ",
+                detail.name.to_uppercase(),
+                detail.tracks.len()
+            ),
+            "[enter] play selected   [A] play all   [x/delete] remove   [esc] playlists",
+            items,
+            detail.index,
+        );
+        return;
+    }
     let items = app
         .playlists
         .iter()
@@ -1514,7 +1640,7 @@ fn render_playlists(frame: &mut Frame<'_>, area: Rect, app: &App) {
         frame,
         area,
         format!(" PLAYLISTS / {} ", app.playlists.len()),
-        "[enter] load and play   use [P] in library to add a track",
+        "[enter] open   use [P] in library or album to add a track",
         items,
         app.playlist_index,
     );
@@ -1774,9 +1900,10 @@ fn render_help(frame: &mut Frame<'_>) {
         Line::from(""),
         help_line("SPACE / p", "pause or resume the active track"),
         help_line("z", "stop playback and release the audio stream"),
-        help_line("Enter", "open album or play selected track"),
-        help_line("A", "play an opened album from the beginning"),
+        help_line("Enter", "open album/playlist or play selected track"),
+        help_line("A", "play an opened album or playlist from the beginning"),
         help_line("P", "add a library/album track to a playlist"),
+        help_line("x / Delete", "remove selected queue/playlist entry"),
         help_line("b / n", "previous / next track"),
         help_line("← / →", "seek backward / forward 5 seconds"),
         help_line("+ / -", "change volume by 5%"),
@@ -2037,6 +2164,27 @@ mod tests {
         app.db.upsert_album(&album, &tracks).unwrap()
     }
 
+    fn seed_playlist(app: &App, name: &str, titles: &[&str]) -> i64 {
+        let playlist = app.db.create_playlist(name).unwrap();
+        for (index, title) in titles.iter().enumerate() {
+            let id = app
+                .db
+                .upsert_track(&crate::model::TrackDraft {
+                    provider: None,
+                    source_id: None,
+                    title: (*title).into(),
+                    artist: "Playlist Artist".into(),
+                    album: None,
+                    path: PathBuf::from(format!("/tmp/{name}-{index}.opus")),
+                    duration_seconds: Some(60),
+                    imported: true,
+                })
+                .unwrap();
+            app.db.add_to_playlist(playlist, id).unwrap();
+        }
+        playlist
+    }
+
     #[test]
     fn selection_stays_in_bounds() {
         assert_eq!(next_index(0, 0), 0);
@@ -2220,6 +2368,89 @@ mod tests {
             );
             assert!(output.contains("ALBUM RECORD"));
             assert!(output.contains("play album"));
+        }
+    }
+
+    #[test]
+    fn opens_playlist_without_playing_and_restores_parent_selection() {
+        let (_directory, mut app) = test_app();
+        seed_playlist(&app, "A", &["One"]);
+        seed_playlist(&app, "B", &["Two"]);
+        app.playlists = app.db.playlists().unwrap();
+        app.screen = Screen::Playlists;
+        app.playlist_index = 1;
+
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.playlist_detail.is_some());
+        assert!(app.queue.is_empty());
+        app.key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert!(app.playlist_detail.is_none());
+        assert_eq!(app.playlist_index, 1);
+    }
+
+    #[test]
+    fn playlist_selection_persists_queue_and_a_starts_from_first() {
+        let (_directory, mut app) = test_app();
+        seed_playlist(&app, "Mix", &["One", "Two"]);
+        app.playlists = app.db.playlists().unwrap();
+        app.screen = Screen::Playlists;
+        app.open_playlist();
+        app.screen_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.screen_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.queue_index, 1);
+        assert_eq!(app.db.load_queue().unwrap().len(), 2);
+        app.screen_key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::NONE));
+        assert_eq!(app.queue_index, 0);
+    }
+
+    #[test]
+    fn removing_playlist_track_refreshes_count_and_preserves_queue_snapshot() {
+        let (_directory, mut app) = test_app();
+        let playlist = seed_playlist(&app, "Mix", &["One", "Two", "Three"]);
+        app.playlists = app.db.playlists().unwrap();
+        app.screen = Screen::Playlists;
+        app.open_playlist();
+        app.queue = app.playlist_detail.as_ref().unwrap().tracks.clone();
+        app.persist_queue();
+        app.playlist_detail.as_mut().unwrap().index = 1;
+
+        app.remove_playlist_track();
+
+        assert_eq!(app.queue.len(), 3);
+        assert_eq!(app.db.load_queue().unwrap().len(), 3);
+        assert_eq!(app.playlists[0].2, 2);
+        assert_eq!(
+            app.db
+                .playlist_tracks(playlist)
+                .unwrap()
+                .into_iter()
+                .map(|track| track.title)
+                .collect::<Vec<_>>(),
+            ["One", "Three"]
+        );
+        assert_eq!(app.playlist_detail.as_ref().unwrap().index, 1);
+    }
+
+    #[test]
+    fn renders_playlist_detail_in_compact_and_wide_terminals() {
+        let (_directory, mut app) = test_app();
+        seed_playlist(&app, "Mix", &["One"]);
+        app.playlists = app.db.playlists().unwrap();
+        app.screen = Screen::Playlists;
+        app.open_playlist();
+        for (width, height) in [(80, 24), (128, 36)] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            let output = terminal.backend().buffer().content().iter().fold(
+                String::new(),
+                |mut output, cell| {
+                    output.push_str(cell.symbol());
+                    output
+                },
+            );
+            assert!(output.contains("PLAYLIST / MIX"));
+            assert!(output.contains("remove"));
         }
     }
 

@@ -415,6 +415,29 @@ impl LibraryDb {
         rows.map(|row| row.map_err(Into::into)).collect()
     }
 
+    pub fn remove_from_playlist(&self, playlist_id: i64, position: usize) -> Result<bool> {
+        let position = i64::try_from(position).context("posicao de playlist invalida")?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let removed = transaction.execute(
+            "DELETE FROM playlist_tracks WHERE playlist_id=?1 AND position=?2",
+            params![playlist_id, position],
+        )?;
+        if removed > 0 {
+            transaction.execute(
+                "UPDATE playlist_tracks SET position=-position-1
+                 WHERE playlist_id=?1 AND position>?2",
+                params![playlist_id, position],
+            )?;
+            transaction.execute(
+                "UPDATE playlist_tracks SET position=-position-2
+                 WHERE playlist_id=?1 AND position<0",
+                [playlist_id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(removed > 0)
+    }
+
     pub fn save_queue(&mut self, tracks: &[Track]) -> Result<()> {
         let transaction = self.connection.transaction()?;
         transaction.execute("DELETE FROM queue", [])?;
@@ -598,6 +621,54 @@ mod tests {
         let playlist = db.create_playlist("Foco").unwrap();
         db.add_to_playlist(playlist, id).unwrap();
         assert_eq!(db.playlist_tracks(playlist).unwrap()[0].title, "One");
+    }
+
+    #[test]
+    fn removes_playlist_tracks_and_compacts_positions() {
+        let db = LibraryDb::in_memory().unwrap();
+        let mut ids = Vec::new();
+        for index in 0..3 {
+            ids.push(
+                db.upsert_track(&TrackDraft {
+                    provider: None,
+                    source_id: None,
+                    title: format!("Track {index}"),
+                    artist: "Artist".into(),
+                    album: None,
+                    path: PathBuf::from(format!("/tmp/playlist-{index}.opus")),
+                    duration_seconds: None,
+                    imported: true,
+                })
+                .unwrap(),
+            );
+        }
+        let playlist = db.create_playlist("Order").unwrap();
+        for id in ids {
+            db.add_to_playlist(playlist, id).unwrap();
+        }
+
+        assert!(db.remove_from_playlist(playlist, 1).unwrap());
+        assert_eq!(
+            db.playlist_tracks(playlist)
+                .unwrap()
+                .into_iter()
+                .map(|track| track.title)
+                .collect::<Vec<_>>(),
+            ["Track 0", "Track 2"]
+        );
+        let positions: Vec<i64> = db
+            .connection
+            .prepare("SELECT position FROM playlist_tracks ORDER BY position")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(positions, [0, 1]);
+        assert!(db.remove_from_playlist(playlist, 1).unwrap());
+        assert!(db.remove_from_playlist(playlist, 0).unwrap());
+        assert!(db.playlist_tracks(playlist).unwrap().is_empty());
+        assert_eq!(db.playlists().unwrap()[0].2, 0);
     }
 
     #[test]
