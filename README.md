@@ -88,13 +88,26 @@ Durante desenvolvimento, substitua `ezmusic` por `cargo run --release --locked -
   avança, setas fazem seek de 5 s, `+/-` alteram volume e `s/r` alternam shuffle/repeat.
 - Busca: `x` ou `Space` marca, `a` marca tudo, `d` baixa a seleção, `Enter` abre o
   resultado e `A` baixa o álbum/playlist completo. `Esc`/`Backspace` volta da coleção.
-- Biblioteca/fila: `Enter` toca; sobre a faixa ativa, pausa ou retoma sem reiniciar.
-  `P` adiciona a uma playlist; `Delete`/`x` remove a faixa selecionada da fila.
+- Biblioteca: a lista principal mostra álbuns e faixas avulsas. `Enter` abre um álbum ou
+  toca uma faixa avulsa; dentro do álbum, `Enter` inicia a fila na faixa selecionada,
+  `A` toca desde o início e `P` adiciona a faixa a uma playlist. `/` filtra por álbum,
+  artista ou faixa, e `Esc`/`Backspace` volta preservando a seleção.
+- Fila: `Enter` toca; sobre a faixa ativa, pausa ou retoma sem reiniciar. `Delete`/`x`
+  remove a faixa selecionada da fila.
+- Playlists: `Enter` abre os detalhes; ali, `Enter` inicia pela faixa selecionada, `A`
+  toca desde o início e `Delete`/`x` remove apenas a associação com a playlist.
+  `Esc`/`Backspace` volta à lista. A fila que já está tocando não muda ao editar.
 - Downloads: `c` cancela o item selecionado.
 
 Para baixar uma coleção, cole a URL pública do álbum ou playlist na busca, abra o
 resultado quando necessário e pressione `A`. O app resolve no máximo 500 faixas e
 mantém os mesmos limites de fila, rede, disco e conversão por faixa.
+
+Um vídeo único com capítulos confiáveis pode virar um álbum: o arquivo-fonte é baixado
+uma vez e cada capítulo é convertido em uma faixa Opus independente. Na ausência de
+capítulos estruturados, o app aceita apenas um índice conservador de timestamps na
+descrição. Títulos como “Full Album” apenas motivam a inspeção; sem ao menos duas marcas
+válidas, crescentes e dentro da duração, o vídeo continua sendo uma faixa única.
 
 No primeiro início, `Enter` aceita o aviso de download responsável; `q` ou `Esc` sai
 sem aceitar.
