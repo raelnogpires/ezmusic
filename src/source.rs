@@ -260,7 +260,11 @@ fn timestamp_chapters(description: &str, duration: f64) -> Option<Vec<(String, f
         };
         let stamp = stamp.trim_matches(['[', ']', '(', ')']);
         if let Some(start) = parse_timestamp(stamp) {
-            if title.trim().is_empty() {
+            if title.trim().is_empty()
+                || title
+                    .split_whitespace()
+                    .any(|part| parse_timestamp(part.trim_matches(['[', ']', '(', ')'])).is_some())
+            {
                 return None;
             }
             starts.push((title.trim().to_string(), start, None));
@@ -459,6 +463,8 @@ mod tests {
             "0:00 One\n0:00 Two",
             "0:30 One\n0:10 Two",
             "0:00 One\n9:00 Two",
+            "0:00 One\n1:99 Broken\n1:30 Three",
+            "0:00 One 1:00 Two\n2:00 Three",
             "0:00 Only",
         ] {
             let mut payload = chapter_video(serde_json::json!([]));
