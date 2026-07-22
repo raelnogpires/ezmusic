@@ -376,8 +376,21 @@ fn normalize_album_title(title: &str) -> String {
         "[album completo]",
         "(album completo)",
     ] {
-        if let Some(index) = result.to_lowercase().find(wrapper) {
-            result.replace_range(index..index + wrapper.len(), "");
+        if result
+            .get(..wrapper.len())
+            .is_some_and(|value| value.eq_ignore_ascii_case(wrapper))
+        {
+            result.replace_range(..wrapper.len(), "");
+        } else if let Some(start) = result.len().checked_sub(wrapper.len())
+            && result
+                .get(start..)
+                .is_some_and(|value| value.eq_ignore_ascii_case(wrapper))
+        {
+            result.truncate(start);
+        } else {
+            continue;
+        }
+        if !result.is_empty() {
             result = result.trim_matches([' ', '-', '–', '—']).to_string();
         }
     }
@@ -483,6 +496,7 @@ mod tests {
         assert_eq!(hinted.kind, SearchKind::Unknown);
         hinted = normalize_item(&serde_json::json!({"id":"b","title":"Help Me"})).unwrap();
         assert_eq!(hinted.kind, SearchKind::Track);
+        assert_eq!(normalize_album_title("İstanbul [Full Album]"), "İstanbul");
     }
 
     #[test]

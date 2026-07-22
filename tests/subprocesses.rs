@@ -314,6 +314,7 @@ printf 'OggS chapter' > "$last"
     let conversions = fs::read_to_string(conversion_log).unwrap();
     assert_eq!(conversions.lines().count(), 2);
     assert!(conversions.contains("-ss 60.000000 -t 60.000000"));
+    assert!(conversions.contains("track=2/2"));
     assert!(fs::read_dir(library).unwrap().all(|entry| {
         !entry
             .unwrap()

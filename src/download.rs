@@ -264,6 +264,7 @@ fn process_request(
                 input,
                 item,
                 &path,
+                index + 1,
                 total,
                 bitrate_kbps,
                 cancelled,
@@ -347,6 +348,7 @@ fn convert_item(
     input: &Path,
     item: &crate::model::SearchItem,
     final_path: &Path,
+    position: usize,
     total: usize,
     bitrate_kbps: u16,
     cancelled: &AtomicBool,
@@ -401,8 +403,12 @@ fn convert_item(
     if let Some(album) = &item.album {
         conversion.args(["-metadata", &format!("album={album}")]);
     }
-    if let Some(segment) = &item.segment {
-        conversion.args(["-metadata", &format!("track={}/{total}", segment.position)]);
+    if item.album_identity.is_some() {
+        let position = item
+            .segment
+            .as_ref()
+            .map_or(position as u32, |segment| segment.position);
+        conversion.args(["-metadata", &format!("track={position}/{total}")]);
     }
     conversion.args(["-f", "opus"]).arg(&part_path);
     if let Err(error) = run_cancellable(conversion, cancelled, shutdown, CONVERSION_TIMEOUT) {
