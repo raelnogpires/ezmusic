@@ -6,14 +6,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use rand::Rng;
+use rand::{Rng, seq::SliceRandom};
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -39,6 +39,7 @@ use crate::{
 enum Screen {
     Search,
     Library,
+    Suggestions,
     Queue,
     Downloads,
     Playlists,
@@ -89,6 +90,7 @@ enum BackgroundEvent {
         kind: SearchKind,
         result: Result<Vec<SearchItem>>,
     },
+    Suggestions(Result<Vec<SearchItem>>),
     DownloadTools(Result<(PathBuf, PathBuf, Vec<DownloadRequest>)>),
     Import(Result<usize>),
 }
@@ -98,6 +100,9 @@ const MAX_PATH_INPUT_CHARS: usize = 4096;
 const MAX_PLAYLIST_NAME_CHARS: usize = 128;
 const MAX_JOB_HISTORY: usize = 512;
 const MAX_SEARCH_HISTORY: usize = 8;
+const MAX_SUGGESTION_SEEDS: usize = 3;
+const MAX_SUGGESTIONS: usize = 20;
+const SUGGESTION_RESULTS_PER_SEED: usize = 10;
 
 #[derive(Debug, Clone)]
 struct JobView {
@@ -151,6 +156,10 @@ struct App {
     search_results: Vec<SearchItem>,
     selected_results: HashSet<usize>,
     search_index: usize,
+    suggestions: Vec<SearchItem>,
+    selected_suggestions: HashSet<usize>,
+    suggestions_index: usize,
+    suggestions_loaded: bool,
     albums: Vec<Album>,
     library: Vec<Track>,
     library_index: usize,
@@ -201,6 +210,10 @@ impl App {
             search_results: Vec::new(),
             selected_results: HashSet::new(),
             search_index: 0,
+            suggestions: Vec::new(),
+            selected_suggestions: HashSet::new(),
+            suggestions_index: 0,
+            suggestions_loaded: false,
             albums,
             library,
             library_index: 0,
@@ -294,6 +307,32 @@ impl App {
                         );
                     }
                     Err(error) => self.status = format!("Nao foi possivel abrir: {error:#}"),
+                }
+            }
+            BackgroundEvent::Suggestions(result) => {
+                self.busy = false;
+                self.suggestions_loaded = true;
+                match result {
+                    Ok(items) => {
+                        self.suggestions = items;
+                        self.selected_suggestions.clear();
+                        self.suggestions_index = 0;
+                        self.status = if self.suggestions.is_empty() {
+                            "Nenhuma sugestao nova encontrada. Pressione R para tentar novamente."
+                                .into()
+                        } else {
+                            format!(
+                                "{} sugestao(oes). X marca, D baixa, R atualiza.",
+                                self.suggestions.len()
+                            )
+                        };
+                    }
+                    Err(error) => {
+                        self.suggestions.clear();
+                        self.selected_suggestions.clear();
+                        self.suggestions_index = 0;
+                        self.status = format!("Sugestoes falharam: {error:#}");
+                    }
                 }
             }
             BackgroundEvent::DownloadTools(result) => {
@@ -445,6 +484,22 @@ impl App {
             }
         }
         self.playlists = self.db.playlists().unwrap_or_default();
+        self.refresh_suggestions();
+    }
+
+    fn refresh_suggestions(&mut self) {
+        if self.suggestions.is_empty() {
+            return;
+        }
+        if let Ok(tracks) = self.db.tracks(None, 5_000, 0) {
+            let suggestions = std::mem::take(&mut self.suggestions);
+            self.suggestions = filter_suggestions(suggestions, &tracks);
+            self.suggestions_index = self
+                .suggestions_index
+                .min(self.suggestions.len().saturating_sub(1));
+            self.selected_suggestions
+                .retain(|index| *index < self.suggestions.len());
+        }
     }
 
     fn apply_library_filter(&mut self) {
@@ -563,6 +618,67 @@ impl App {
                 result,
             });
         });
+    }
+
+    fn load_suggestions(&mut self, force: bool) {
+        if self.busy {
+            self.status = "Aguarde a operacao atual terminar.".into();
+            return;
+        }
+        if self.suggestions_loaded && !force {
+            return;
+        }
+        let tracks = match self.db.tracks(None, 5_000, 0) {
+            Ok(tracks) => tracks,
+            Err(error) => {
+                self.status = format!("Falha ao ler biblioteca: {error:#}");
+                return;
+            }
+        };
+        let queries = suggestion_queries(&tracks);
+        if queries.is_empty() {
+            self.suggestions_loaded = true;
+            self.suggestions.clear();
+            self.selected_suggestions.clear();
+            self.status =
+                "A biblioteca ainda nao tem artistas ou titulos uteis para sugerir musica.".into();
+            return;
+        }
+        self.busy = true;
+        self.status = format!("Buscando sugestoes para {} referencia(s)...", queries.len());
+        let tools = self.tools.clone();
+        let sender = self.background_tx.clone();
+        thread::spawn(move || {
+            let result = tools.ensure(ToolKind::YtDlp).and_then(|path| {
+                let provider = YouTubeProvider::new(path);
+                suggestions_from_provider(&provider, &queries, &tracks)
+            });
+            let _ = sender.send(BackgroundEvent::Suggestions(result));
+        });
+    }
+
+    fn start_selected_suggestions(&mut self) {
+        if self.busy {
+            self.status = "Aguarde a operacao atual terminar.".into();
+            return;
+        }
+        let items: Vec<_> = if self.selected_suggestions.is_empty() {
+            self.suggestions
+                .get(self.suggestions_index)
+                .cloned()
+                .into_iter()
+                .collect()
+        } else {
+            self.selected_suggestions
+                .iter()
+                .filter_map(|index| self.suggestions.get(*index).cloned())
+                .collect()
+        };
+        if items.is_empty() {
+            self.status = "Nenhuma sugestao selecionada.".into();
+            return;
+        }
+        self.start_download_items(items);
     }
 
     fn resolve_current(&mut self) {
@@ -970,6 +1086,10 @@ impl App {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('1') => self.screen = Screen::Search,
             KeyCode::Char('2') => self.screen = Screen::Library,
+            KeyCode::Char('6') => {
+                self.screen = Screen::Suggestions;
+                self.load_suggestions(false);
+            }
             KeyCode::Char('3') => self.screen = Screen::Queue,
             KeyCode::Char('4') => self.screen = Screen::Downloads,
             KeyCode::Char('5') => self.screen = Screen::Playlists,
@@ -985,7 +1105,9 @@ impl App {
                 self.input_mode = InputMode::Import;
                 self.input.clear();
             }
-            KeyCode::Char(' ') if self.screen != Screen::Search => self.toggle_playback(),
+            KeyCode::Char(' ') if !matches!(self.screen, Screen::Search | Screen::Suggestions) => {
+                self.toggle_playback()
+            }
             KeyCode::Char('p') => self.toggle_playback(),
             KeyCode::Char('z') => self.stop_playback(),
             KeyCode::Char('n') => self.next_track(),
@@ -1069,6 +1191,26 @@ impl App {
                 KeyCode::Char('A') => self.download_full_collection(),
                 KeyCode::Enter => self.resolve_current(),
                 KeyCode::Char('d') => self.start_selected_downloads(),
+                _ => {}
+            },
+            Screen::Suggestions => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.suggestions_index = self.suggestions_index.saturating_sub(1)
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.suggestions_index =
+                        next_index(self.suggestions_index, self.suggestions.len())
+                }
+                KeyCode::Char('x') | KeyCode::Char(' ') => {
+                    if !self.selected_suggestions.remove(&self.suggestions_index) {
+                        self.selected_suggestions.insert(self.suggestions_index);
+                    }
+                }
+                KeyCode::Char('a') => {
+                    self.selected_suggestions = (0..self.suggestions.len()).collect()
+                }
+                KeyCode::Char('d') => self.start_selected_suggestions(),
+                KeyCode::Char('R') => self.load_suggestions(true),
                 _ => {}
             },
             Screen::Library => match key.code {
@@ -1301,6 +1443,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ("3", "QUEUE", Screen::Queue),
         ("4", "TRANSFERS", Screen::Downloads),
         ("5", "PLAYLISTS", Screen::Playlists),
+        ("6", "SUGGEST", Screen::Suggestions),
     ];
     let mut navigation = Vec::new();
     for (key, label, screen) in tabs {
@@ -1364,10 +1507,48 @@ fn render_screen(frame: &mut Frame<'_>, area: Rect, app: &App) {
     match app.screen {
         Screen::Search => render_search(frame, area, app),
         Screen::Library => render_library(frame, area, app),
+        Screen::Suggestions => render_suggestions(frame, area, app),
         Screen::Queue => render_queue(frame, area, app),
         Screen::Downloads => render_downloads(frame, area, app),
         Screen::Playlists => render_playlists(frame, area, app),
     }
+}
+
+fn render_suggestions(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let items = app
+        .suggestions
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let selected = if app.selected_suggestions.contains(&index) {
+                "◆"
+            } else {
+                "◇"
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{selected} "), Style::default().fg(ACCENT)),
+                Span::styled(item.title.clone(), Style::default().fg(TEXT)),
+                Span::styled(format!("  /  {}", item.artist), Style::default().fg(MUTED)),
+                Span::styled(
+                    format!("  {}", duration_label(item.duration_seconds)),
+                    Style::default().fg(MUTED),
+                ),
+            ]))
+        })
+        .collect();
+    let title = if app.busy {
+        " SUGGEST / BUSCANDO... ".into()
+    } else {
+        format!(" SUGGEST / {} ITEMS ", app.suggestions.len())
+    };
+    render_list(
+        frame,
+        area,
+        title,
+        "[x/space] mark   [a] all   [d] download   [R] refresh",
+        items,
+        app.suggestions_index,
+    );
 }
 
 fn render_search(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -2084,6 +2265,92 @@ fn duration_label(duration: Option<u64>) -> String {
         .unwrap_or_else(|| "--:--".into())
 }
 
+fn suggestion_queries(tracks: &[Track]) -> Vec<String> {
+    let mut queries = tracks
+        .iter()
+        .filter(|track| track.available)
+        .filter_map(|track| {
+            let artist = track.artist.trim();
+            let query = if artist.is_empty() || artist.eq_ignore_ascii_case("desconhecido") {
+                track.title.trim()
+            } else {
+                artist
+            };
+            (!query.is_empty()).then(|| query.to_string())
+        })
+        .collect::<Vec<_>>();
+    queries.sort_by_cached_key(|query| query.to_lowercase());
+    queries.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    queries.shuffle(&mut rand::rng());
+    queries.truncate(MAX_SUGGESTION_SEEDS);
+    queries
+}
+
+fn suggestions_from_provider(
+    provider: &dyn SourceProvider,
+    queries: &[String],
+    tracks: &[Track],
+) -> Result<Vec<SearchItem>> {
+    let mut items = Vec::new();
+    let mut failures = 0;
+    for query in queries {
+        match provider.search(query, SUGGESTION_RESULTS_PER_SEED) {
+            Ok(mut result) => items.append(&mut result),
+            Err(_) => failures += 1,
+        }
+    }
+    if items.is_empty() && failures == queries.len() {
+        bail!("nenhuma busca de sugestao foi concluida");
+    }
+    Ok(filter_suggestions(items, tracks))
+}
+
+fn filter_suggestions(items: Vec<SearchItem>, tracks: &[Track]) -> Vec<SearchItem> {
+    let mut local_sources = HashSet::new();
+    let mut local_pairs = HashSet::new();
+    let mut local_titles = HashSet::new();
+    for track in tracks {
+        if let (Some(provider), Some(source_id)) = (&track.provider, &track.source_id) {
+            local_sources.insert((provider.to_lowercase(), source_id.to_lowercase()));
+        }
+        let title = normalize_suggestion_text(&track.title);
+        if title.is_empty() {
+            continue;
+        }
+        if track.artist.eq_ignore_ascii_case("desconhecido") || track.artist.trim().is_empty() {
+            local_titles.insert(title);
+        } else {
+            local_pairs.insert((normalize_suggestion_text(&track.artist), title));
+        }
+    }
+
+    let mut seen_sources = HashSet::new();
+    let mut seen_pairs = HashSet::new();
+    items
+        .into_iter()
+        .filter(|item| item.kind == SearchKind::Track)
+        .filter(|item| {
+            let source = (item.provider.to_lowercase(), item.source_id.to_lowercase());
+            seen_sources.insert(source.clone())
+                && !local_sources.contains(&source)
+                && !local_titles.contains(&normalize_suggestion_text(&item.title))
+                && seen_pairs.insert((
+                    normalize_suggestion_text(&item.artist),
+                    normalize_suggestion_text(&item.title),
+                ))
+                && !local_pairs.contains(&(
+                    normalize_suggestion_text(&item.artist),
+                    normalize_suggestion_text(&item.title),
+                ))
+        })
+        .take(MAX_SUGGESTIONS)
+        .collect()
+}
+
+fn normalize_suggestion_text(value: &str) -> String {
+    value.trim().to_lowercase()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2451,6 +2718,81 @@ mod tests {
             );
             assert!(output.contains("PLAYLIST / MIX"));
             assert!(output.contains("remove"));
+        }
+    }
+
+    #[test]
+    fn suggestion_queries_use_artists_and_unknown_file_titles() {
+        let mut known = track(1);
+        known.artist = "Known Artist".into();
+        let mut imported = track(2);
+        imported.artist = "Desconhecido".into();
+        imported.title = "local-file".into();
+
+        let queries = suggestion_queries(&[known, imported]);
+
+        assert_eq!(queries.len(), 2);
+        assert!(queries.iter().any(|query| query == "Known Artist"));
+        assert!(queries.iter().any(|query| query == "local-file"));
+    }
+
+    #[test]
+    fn filters_existing_duplicate_and_non_track_suggestions() {
+        let mut local = track(1);
+        local.provider = Some("youtube".into());
+        local.source_id = Some("existing".into());
+        local.title = "Already Here".into();
+        local.artist = "Artist".into();
+        let mut imported = track(2);
+        imported.title = "Imported Name".into();
+        imported.artist = "Desconhecido".into();
+
+        let mut existing = search_item("existing", SearchKind::Track);
+        existing.title = "Different Title".into();
+        let mut same_title = search_item("new-id", SearchKind::Track);
+        same_title.title = "Imported Name".into();
+        let mut new_track = search_item("fresh", SearchKind::Track);
+        new_track.title = "Fresh Song".into();
+        let album = search_item("album", SearchKind::Album);
+
+        let filtered = filter_suggestions(
+            vec![existing, same_title, new_track.clone(), album, new_track],
+            &[local, imported],
+        );
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].source_id, "fresh");
+    }
+
+    #[test]
+    fn suggestion_selection_uses_existing_download_flow_input() {
+        let (_directory, mut app) = test_app();
+        app.screen = Screen::Suggestions;
+        app.suggestions = vec![search_item("one", SearchKind::Track)];
+
+        app.screen_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+
+        assert!(app.selected_suggestions.contains(&0));
+    }
+
+    #[test]
+    fn renders_suggestions_in_compact_and_wide_terminals() {
+        let (_directory, mut app) = test_app();
+        app.screen = Screen::Suggestions;
+        app.suggestions = vec![search_item("fresh", SearchKind::Track)];
+        for (width, height) in [(80, 24), (128, 36)] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            let output = terminal.backend().buffer().content().iter().fold(
+                String::new(),
+                |mut output, cell| {
+                    output.push_str(cell.symbol());
+                    output
+                },
+            );
+            assert!(output.contains("SUGGEST"));
+            assert!(output.contains("Item fresh"));
         }
     }
 
