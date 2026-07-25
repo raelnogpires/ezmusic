@@ -84,7 +84,8 @@ Durante desenvolvimento, substitua `ezmusic` por `cargo run --release --locked -
 ## Controles da TUI
 
 - Globais: `1`–`6` abrem Busca, Biblioteca, Fila, Downloads, Playlists e Sugestões; `j/k` navegam,
-  `/` busca, `I` importa, `?` mostra ajuda e `q`/`Ctrl-C` saem.
+  `/` busca, `I` importa, `v` mostra/esconde o visualizador cyberpunk lateral, `?` mostra ajuda
+  e `q`/`Ctrl-C` saem.
 - Player: `Space`/`p` pausa ou retoma, `z` para e libera o stream, `b/n` volta ou
   avança, setas fazem seek de 5 s, `+/-` alteram volume e `s/r` alternam shuffle/repeat.
 - Busca: `x` ou `Space` marca, `a` marca tudo, `d` baixa a seleção, `Enter` abre o

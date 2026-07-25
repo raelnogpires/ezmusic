@@ -98,4 +98,6 @@ lista e o deck do player. Uma guarda RAII restaura cursor, tela alternativa e mo
 mesmo quando uma operação retorna erro. A navegação de coleções conserva no máximo oito
 páginas de histórico com cursor e seleção. Biblioteca e playlists possuem uma lista
 principal e uma tela de detalhes; entrar abre sem tocar, `A` toca desde o início e voltar
-restaura a seleção anterior. Ações longas rodam fora do thread da interface.
+restaura a seleção anterior. Em terminais com pelo menos 125 colunas, `v` abre ao lado da
+sessão um painel cyberpunk ASCII de três quadros; o tick da TUI avança o quadro a cada 180 ms
+sem envolver o callback de áudio. Ações longas rodam fora do thread da interface.
