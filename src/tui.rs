@@ -175,6 +175,9 @@ struct App {
     playlist_detail: Option<PlaylistDetail>,
     shuffle: bool,
     repeat: RepeatMode,
+    show_cyber_panel: bool,
+    cyber_frame: usize,
+    cyber_frame_at: Instant,
     show_help: bool,
     should_quit: bool,
 }
@@ -229,6 +232,9 @@ impl App {
             playlist_detail: None,
             shuffle: false,
             repeat: RepeatMode::Off,
+            show_cyber_panel: false,
+            cyber_frame: 0,
+            cyber_frame_at: Instant::now(),
             show_help: false,
             should_quit: false,
         })
@@ -254,6 +260,11 @@ impl App {
                     self.status = error;
                 }
             }
+        }
+        if self.show_cyber_panel && self.cyber_frame_at.elapsed() >= Duration::from_millis(180) {
+            self.cyber_frame = (self.cyber_frame + 1) % CYBER_FRAMES.len();
+            self.cyber_frame_at = Instant::now();
+            changed = true;
         }
         changed
     }
@@ -1084,6 +1095,14 @@ impl App {
         }
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('v') => {
+                self.show_cyber_panel = !self.show_cyber_panel;
+                self.cyber_frame_at = Instant::now();
+                self.status = format!(
+                    "Cyber visualizer: {}.",
+                    if self.show_cyber_panel { "on" } else { "off" }
+                );
+            }
             KeyCode::Char('1') => self.screen = Screen::Search,
             KeyCode::Char('2') => self.screen = Screen::Library,
             KeyCode::Char('6') => {
@@ -1410,6 +1429,39 @@ const BORDER: Color = Color::Rgb(55, 65, 77);
 const SURFACE: Color = Color::Rgb(22, 27, 34);
 const SELECTION: Color = Color::Rgb(35, 46, 52);
 
+const CYBER_FRAMES: &[&[&str]] = &[
+    &[
+        " .------.   .------. ",
+        r#"/  .--.  \\ /  .--.  \\"#,
+        "| | 01 | | | | 10 | |",
+        "| '--' | | | '--' | |",
+        r#"\\  '--' / \\  '--' /"#,
+        " '------'   '------' ",
+        "  // NEON SIGNAL //  ",
+        "  010101 110010 01  ",
+    ],
+    &[
+        " .------.   .------. ",
+        r#"/  .--.  \\ /  .--.  \\"#,
+        "| | 10 | | | | 01 | |",
+        "| '--' | | | '--' | |",
+        r#"\\  '--' / \\  '--' /"#,
+        " '------'   '------' ",
+        "  // NEON SIGNAL //  ",
+        "  101010 001101 10  ",
+    ],
+    &[
+        " .------.   .------. ",
+        r#"/  .--.  \\ /  .--.  \\"#,
+        "| | 11 | | | | 00 | |",
+        "| '--' | | | '--' | |",
+        r#"\\  '--' / \\  '--' /"#,
+        " '------'   '------' ",
+        "  // NEON SIGNAL //  ",
+        "  001100 111000 01  ",
+    ],
+];
+
 fn render(frame: &mut Frame<'_>, app: &App) {
     let area = frame.area();
     frame.render_widget(
@@ -1491,7 +1543,23 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn render_workspace(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    if area.width >= 104 {
+    if app.show_cyber_panel && area.width >= 125 {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(60), Constraint::Length(63)])
+            .split(area);
+        let sidebars = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(31),
+                Constraint::Length(1),
+                Constraint::Length(31),
+            ])
+            .split(columns[1]);
+        render_screen(frame, columns[0], app);
+        render_context(frame, sidebars[0], app);
+        render_cyber_panel(frame, sidebars[2], app);
+    } else if area.width >= 104 {
         let columns = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Min(60), Constraint::Length(31)])
@@ -1501,6 +1569,19 @@ fn render_workspace(frame: &mut Frame<'_>, area: Rect, app: &App) {
     } else {
         render_screen(frame, area, app);
     }
+}
+
+fn render_cyber_panel(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let lines = CYBER_FRAMES[app.cyber_frame % CYBER_FRAMES.len()]
+        .iter()
+        .map(|line| Line::from(*line))
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().fg(ACCENT))
+            .block(panel(" CYBER // SIGNAL ".into())),
+        area,
+    );
 }
 
 fn render_screen(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -1920,6 +2001,10 @@ fn render_context(frame: &mut Frame<'_>, area: Rect, app: &App) {
             key_span("A"),
             Span::styled(" full album", Style::default().fg(MUTED)),
         ]),
+        Line::from(vec![
+            key_span("V"),
+            Span::styled(" cyber visualizer", Style::default().fg(MUTED)),
+        ]),
     ];
     frame.render_widget(
         Paragraph::new(lines)
@@ -2089,6 +2174,7 @@ fn render_help(frame: &mut Frame<'_>) {
         help_line("← / →", "seek backward / forward 5 seconds"),
         help_line("+ / -", "change volume by 5%"),
         help_line("s / r", "cycle shuffle / repeat"),
+        help_line("v", "show or hide the cyberpunk side visualizer"),
         Line::from(""),
         help_line("1 ... 6", "switch workspace"),
         help_line("j / k", "move selection"),
@@ -2507,6 +2593,35 @@ mod tests {
             assert!(output.contains("STOP"));
             assert!(output.contains("full album"));
         }
+    }
+
+    #[test]
+    fn toggles_cyberpunk_visualizer_and_advances_frames() {
+        let (_directory, mut app) = test_app();
+        app.key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        assert!(app.show_cyber_panel);
+
+        app.cyber_frame_at = Instant::now() - Duration::from_millis(200);
+        assert!(app.tick());
+        assert_eq!(app.cyber_frame, 1);
+
+        let backend = TestBackend::new(128, 36);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let output =
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .fold(String::new(), |mut output, cell| {
+                    output.push_str(cell.symbol());
+                    output
+                });
+        assert!(output.contains("CYBER // SIGNAL"));
+
+        app.key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        assert!(!app.show_cyber_panel);
     }
 
     #[test]
