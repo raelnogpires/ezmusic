@@ -261,8 +261,8 @@ impl App {
                 }
             }
         }
-        if self.show_cyber_panel && self.cyber_frame_at.elapsed() >= Duration::from_millis(180) {
-            self.cyber_frame = (self.cyber_frame + 1) % CYBER_FRAMES.len();
+        if self.show_cyber_panel && self.cyber_frame_at.elapsed() >= CYBER_FRAME_DURATION {
+            self.cyber_frame = (self.cyber_frame + 1) % CYBER_FRAME_COUNT;
             self.cyber_frame_at = Instant::now();
             changed = true;
         }
@@ -1429,38 +1429,110 @@ const BORDER: Color = Color::Rgb(55, 65, 77);
 const SURFACE: Color = Color::Rgb(22, 27, 34);
 const SELECTION: Color = Color::Rgb(35, 46, 52);
 
-const CYBER_FRAMES: &[&[&str]] = &[
-    &[
-        " .------.   .------. ",
-        r#"/  .--.  \\ /  .--.  \\"#,
-        "| | 01 | | | | 10 | |",
-        "| '--' | | | '--' | |",
-        r#"\\  '--' / \\  '--' /"#,
-        " '------'   '------' ",
-        "  // NEON SIGNAL //  ",
-        "  010101 110010 01  ",
-    ],
-    &[
-        " .------.   .------. ",
-        r#"/  .--.  \\ /  .--.  \\"#,
-        "| | 10 | | | | 01 | |",
-        "| '--' | | | '--' | |",
-        r#"\\  '--' / \\  '--' /"#,
-        " '------'   '------' ",
-        "  // NEON SIGNAL //  ",
-        "  101010 001101 10  ",
-    ],
-    &[
-        " .------.   .------. ",
-        r#"/  .--.  \\ /  .--.  \\"#,
-        "| | 11 | | | | 00 | |",
-        "| '--' | | | '--' | |",
-        r#"\\  '--' / \\  '--' /"#,
-        " '------'   '------' ",
-        "  // NEON SIGNAL //  ",
-        "  001100 111000 01  ",
-    ],
-];
+const CYBER_FRAME_COUNT: usize = 44;
+const CYBER_FRAME_DURATION: Duration = Duration::from_millis(100);
+
+fn cyber_symbol(brightness: f32, fire: bool, edge: bool, phase: f32) -> char {
+    if edge {
+        return if phase.sin() >= 0.0 { '/' } else { '\\' };
+    }
+    if fire {
+        return match (brightness * 6.0) as usize {
+            0 => '.',
+            1 => '+',
+            2 => 'x',
+            3 => 'X',
+            4 => '#',
+            _ => '%',
+        };
+    }
+    const RAMP: &[u8] = b" .,:;irsXA253hMHGS#9B&@";
+    RAMP[(brightness.clamp(0.0, 1.0) * (RAMP.len() - 1) as f32) as usize] as char
+}
+
+fn cyber_lines(width: u16, height: u16, frame: usize) -> Vec<Line<'static>> {
+    let phase =
+        (frame % CYBER_FRAME_COUNT) as f32 / CYBER_FRAME_COUNT as f32 * std::f32::consts::TAU;
+    let width = width.max(1) as f32;
+    let height = height.max(1) as f32;
+
+    (0..height as usize)
+        .map(|row| {
+            let y = (row as f32 + 0.5) / height * 2.0 - 1.0;
+            let spans: Vec<Span<'static>> = (0..width as usize)
+                .map(|column| {
+                    let x = (column as f32 + 0.5) / width * 2.0 - 1.0;
+                    let eye_limit = 0.58 * (1.0 - x.abs().powf(1.7)).max(0.0).powf(0.35);
+                    let in_eye = y.abs() < eye_limit;
+                    let hair = y < -0.18
+                        && (x + 0.13 * (y * 15.0 + phase * 0.4).sin()).abs()
+                            < 0.58 + 0.08 * (phase + x * 5.0).sin();
+                    let background = SURFACE;
+                    let (foreground, brightness, fire, edge) = if in_eye {
+                        let iris_x = x / 0.39;
+                        let iris_y = (y - 0.02) / 0.39;
+                        let iris_radius = (iris_x * iris_x + iris_y * iris_y).sqrt();
+                        let lid = eye_limit - y.abs();
+                        let edge = lid < 0.075;
+                        if iris_radius < 1.0 {
+                            let angle = iris_y.atan2(iris_x);
+                            let flame = (phase * 1.2 + angle * 5.0 + iris_radius * 22.0).sin();
+                            let pulse = 0.5 + 0.5 * (phase.sin() * 0.7 + flame * 0.3);
+                            let crack = (angle * 8.0 + phase * 0.55).sin().abs() > 0.965
+                                && iris_radius > 0.16;
+                            let pupil = iris_radius < 0.18;
+                            let brightness = (0.55 + pulse * 0.45).clamp(0.0, 1.0);
+                            let foreground = if pupil {
+                                Color::Black
+                            } else if crack {
+                                TEXT
+                            } else {
+                                ACCENT
+                            };
+                            (
+                                foreground,
+                                if pupil { 0.95 } else { brightness },
+                                !pupil,
+                                edge,
+                            )
+                        } else {
+                            let brightness = 0.45 + 0.18 * (phase + x * 3.0).sin();
+                            (TEXT, brightness, false, edge)
+                        }
+                    } else if hair {
+                        let brightness = 0.25 + 0.55 * (0.5 + 0.5 * (x * 12.0 + phase).sin());
+                        (MUTED, brightness, false, false)
+                    } else {
+                        let brightness = 0.16 + 0.12 * (phase + x * 4.0).sin().abs();
+                        (BORDER, brightness, false, false)
+                    };
+
+                    let lid_phase = phase + x * 9.0;
+                    let symbol = if in_eye && (y - 0.02).abs() < 0.18 && x.abs() < 0.16 {
+                        if (x * 40.0 + phase.sin() * 2.0).abs() < 2.0 {
+                            '@'
+                        } else {
+                            '#'
+                        }
+                    } else {
+                        cyber_symbol(brightness, fire, edge, lid_phase)
+                    };
+                    Span::styled(
+                        symbol.to_string(),
+                        Style::default().fg(foreground).bg(background).add_modifier(
+                            if brightness > 0.82 {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            },
+                        ),
+                    )
+                })
+                .collect();
+            Line::from(spans)
+        })
+        .collect()
+}
 
 fn render(frame: &mut Frame<'_>, app: &App) {
     let area = frame.area();
@@ -1572,16 +1644,10 @@ fn render_workspace(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn render_cyber_panel(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let lines = CYBER_FRAMES[app.cyber_frame % CYBER_FRAMES.len()]
-        .iter()
-        .map(|line| Line::from(*line))
-        .collect::<Vec<_>>();
-    frame.render_widget(
-        Paragraph::new(lines)
-            .style(Style::default().fg(ACCENT))
-            .block(panel(" CYBER // SIGNAL ".into())),
-        area,
-    );
+    let block = panel(" CYBER // SIGNAL // FLAMING EYE ".into());
+    let inner = block.inner(area);
+    let lines = cyber_lines(inner.width, inner.height, app.cyber_frame);
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn render_screen(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -2601,7 +2667,7 @@ mod tests {
         app.key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
         assert!(app.show_cyber_panel);
 
-        app.cyber_frame_at = Instant::now() - Duration::from_millis(200);
+        app.cyber_frame_at = Instant::now() - CYBER_FRAME_DURATION;
         assert!(app.tick());
         assert_eq!(app.cyber_frame, 1);
 

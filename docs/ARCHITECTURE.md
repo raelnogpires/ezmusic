@@ -99,5 +99,6 @@ mesmo quando uma operação retorna erro. A navegação de coleções conserva n
 páginas de histórico com cursor e seleção. Biblioteca e playlists possuem uma lista
 principal e uma tela de detalhes; entrar abre sem tocar, `A` toca desde o início e voltar
 restaura a seleção anterior. Em terminais com pelo menos 125 colunas, `v` abre ao lado da
-sessão um painel cyberpunk ASCII de três quadros; o tick da TUI avança o quadro a cada 180 ms
+sessão um painel cyberpunk ASCII de 44 quadros (olho em chamas) usando a paleta da TUI;
+o tick avança o quadro a cada 100 ms
 sem envolver o callback de áudio. Ações longas rodam fora do thread da interface.
