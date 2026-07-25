@@ -8,7 +8,8 @@ quando apenas toca um arquivo local.
 
 O MVP oferece busca textual no YouTube, resolução de URLs públicas do YouTube e
 YouTube Music, seleção de faixas ou coleções, download completo de álbuns/playlists,
-conversão Opus, biblioteca SQLite, importação de pastas, fila, playlists e player com
+conversão Opus, biblioteca SQLite, importação de pastas, fila, playlists, sugestões
+baseadas na biblioteca e player com
 seek, volume, shuffle e repeat.
 
 Limites de segurança deliberados:
@@ -82,12 +83,16 @@ Durante desenvolvimento, substitua `ezmusic` por `cargo run --release --locked -
 
 ## Controles da TUI
 
-- Globais: `1`–`5` abrem Busca, Biblioteca, Fila, Downloads e Playlists; `j/k` navegam,
+- Globais: `1`–`6` abrem Busca, Biblioteca, Fila, Downloads, Playlists e Sugestões; `j/k` navegam,
   `/` busca, `I` importa, `?` mostra ajuda e `q`/`Ctrl-C` saem.
 - Player: `Space`/`p` pausa ou retoma, `z` para e libera o stream, `b/n` volta ou
   avança, setas fazem seek de 5 s, `+/-` alteram volume e `s/r` alternam shuffle/repeat.
 - Busca: `x` ou `Space` marca, `a` marca tudo, `d` baixa a seleção, `Enter` abre o
   resultado e `A` baixa o álbum/playlist completo. `Esc`/`Backspace` volta da coleção.
+- Sugestões: ao abrir a aba `6`, o app consulta até três artistas distintos da biblioteca
+  (ou o nome do arquivo quando o artista importado é desconhecido), mostra até 20 faixas
+  novas e não acessa a rede novamente até `R`. Use `x`/`Space`, `a` e `d` para selecionar
+  e baixar; resultados já presentes na biblioteca são removidos.
 - Biblioteca: a lista principal mostra álbuns e faixas avulsas. `Enter` abre um álbum ou
   toca uma faixa avulsa; dentro do álbum, `Enter` inicia a fila na faixa selecionada,
   `A` toca desde o início e `P` adiciona a faixa a uma playlist. `/` filtra por álbum,

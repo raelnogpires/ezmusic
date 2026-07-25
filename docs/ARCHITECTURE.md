@@ -39,7 +39,11 @@ configuração externos, tem retries e timeout, retorna no máximo 500 itens e s
 JSON é limitada a 16 MiB. Isso impede playlists ou processos defeituosos de crescerem
 memória indefinidamente.
 
-Uma consulta textual vira `ytsearchN:consulta`; uma URL é resolvida diretamente.
+Uma consulta textual vira `ytsearchN:consulta`; uma URL é resolvida diretamente. A aba de
+sugestões reutiliza a mesma busca textual: escolhe até três artistas (ou títulos de arquivos
+importados sem metadados), consulta dez resultados por semente em background, remove faixas
+locais e limita a rodada a vinte itens. A rodada fica apenas em memória e `R` força uma nova
+consulta.
 Resultados do tipo álbum/playlist podem ser abertos como uma página ou expandidos para
 download integral. A busca textual continua usando metadados planos; ao abrir ou preparar
 uma faixa/resultado desconhecido, uma segunda extração sem `--flat-playlist` inspeciona os
